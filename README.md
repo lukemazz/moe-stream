@@ -16,8 +16,10 @@ Measured on M4 / 24 GB / NVMe:
   + hybrid gather_qmm dispatch          up to 5.5 tok/s decode,
                                         ~77 tok/s prefill (1.2k-token prompt)
   + all-LRU split (filler off, default) 7.2 tok/s decode, 96.3% hit rate
-  + async deferred lookahead + decode
-    fast path (no per-layer syncs)      ~13 tok/s decode (warm cache)
+  + cross-token prefetch (embed hook)   7.35 tok/s
+  + deferred async lookahead            11.1 tok/s
+  + scatter-free T=1 decode path        12.1 tok/s
+  + merged gate/up projections          12.8 tok/s cold / ~13 tok/s warm
 ```
 
 ---
@@ -144,6 +146,70 @@ path: **LRU → prefetch → filler → SSD (sync load, counted as a miss)**.
 
 The transition table is tiny (40×256×256 float16 ≈ 5 MB) and pays for itself
 immediately: in our tests it roughly doubled throughput.
+
+---
+
+## Optimization journey (1.8 → ~13 tok/s)
+
+Each step below was measured on the same 448-token benchmark (M4 / 24 GB /
+NVMe) with `tools/bench_breakdown.py`. The lesson that repeats throughout:
+on this workload the wins came from **removing GPU↔CPU synchronization and
+small-kernel overhead from the decode critical path**, not from faster IO.
+
+1. **Transition-table prefetch** (1.8 → 3.7 tok/s). A 40×256×256 table of
+   expert→expert transition statistics, built offline by the profiler,
+   predicts the next layers' experts so SSD reads overlap GPU compute.
+   Roughly doubled throughput on its own.
+
+2. **Router lookahead / pre-gating** (3.7 → 3.9, hit rate up to 89%). The
+   routers of the next `depth` layers — tiny and always resident — are
+   applied directly to the *current* hidden state. The residual stream
+   changes slowly between adjacent layers, so this predicts upcoming experts
+   far better than static statistics.
+
+3. **Hybrid expert dispatch** (up to 5.5 decode, ~77 tok/s prefill). With
+   many tokens (prefill), three `gather_qmm` kernels replace hundreds of
+   small matmuls/scatters that previously blew up the lazy graph on 1k+
+   token prompts. With a single token (decode), stacking the 8 active
+   experts' weights costs more in GPU copies than the batched kernel saves —
+   so decode keeps the per-expert `quantized_matmul` loop. Knowing *when* a
+   batched kernel wins matters as much as having it.
+
+4. **All-LRU RAM split** (5.5 → 7.2, 96.3% hit rate). A/B testing showed
+   that giving the filler tier's RAM to the LRU beats random warm fill:
+   96.3% vs 92.0% hit rate, −41% sync SSD loads, +10% tok/s. The LRU keeps
+   the experts that are *actually* hot. Filler stays available via `--split`.
+
+5. **Cross-token prefetch via embedding hook** (7.2 → 7.35). The moment the
+   freshly sampled token is embedded, the first layers' routers run on the
+   embedding and their experts are prefetched — SSD loads overlap layer-0
+   attention instead of the first MoE layers starting cold. Also dropped the
+   softmax in lookahead ranking (monotonic — the ordering is identical on
+   raw logits).
+
+6. **Deferred async lookahead** (7.35 → 11.1 — the biggest single win).
+   Reading back the lookahead's top-k expert indices forced ~40 graph syncs
+   per token, serializing GPU and CPU. The indices are now scheduled with
+   `mx.async_eval` and consumed *one layer later*, when the GPU has already
+   produced them. Prediction lags one layer behind but the critical path
+   loses all per-layer syncs.
+
+7. **Scatter-free T=1 decode path** (11.1 → 12.1). The decode path stacked
+   scatters into a zeros buffer; since the router's k experts are distinct,
+   a plain `mx.stack` of the k outputs suffices.
+
+8. **Merged gate/up projections** (12.1 → 12.8 cold / ~13 warm). `gate_proj`
+   and `up_proj` are concatenated into a single `gateup` matrix at shard
+   load, halving the matmul count on the gate/up side in every dispatch
+   path. The Metal wired-memory limit is also set explicitly at startup.
+
+**Dead ends, kept for the record:** threads cannot encode Metal work
+concurrently (hence `mx.async_eval` pipelining instead of worker threads);
+`mx.compile` of the expert chain measured *slower* (extra dispatch
+overhead); wider prefetch (32 experts/layer) hurt due to SSD bandwidth
+contention. The remaining plateau is structural — per-layer router readback
+plus attention compute; going past ~15 tok/s would need GPU-side dispatch
+or custom kernels.
 
 ---
 
