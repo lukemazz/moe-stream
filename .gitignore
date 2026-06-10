@@ -1,0 +1,12 @@
+# model weights and derived data (huge, regenerable)
+experts/
+transition_table.npy
+*.gguf
+*.safetensors
+
+# unrelated local project (native C engine)
+q36/
+
+__pycache__/
+*.pyc
+.DS_Store

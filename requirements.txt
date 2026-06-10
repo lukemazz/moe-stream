@@ -1,0 +1,4 @@
+mlx>=0.31.0
+mlx-lm>=0.31.1
+numpy
+huggingface_hub

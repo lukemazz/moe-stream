@@ -1,0 +1,168 @@
+"""MLX model wrapper: replaces SwitchGLU in each MoE layer with a streamed
+version that pulls expert weights through the three-tier cache and triggers
+predictive prefetch after each router decision (spec sections 3, 6, 8).
+"""
+
+import json
+import time
+from pathlib import Path
+
+import mlx.core as mx
+import mlx.nn as nn
+import numpy as np
+
+from .cache import ExpertCache, LRU, PREFETCH
+from .io_pool import FillerLoop, IOPool
+from .predictor import Predictor
+
+
+def _swiglu(gate, up):
+    return nn.silu(gate) * up
+
+
+class StreamedSwitchGLU(nn.Module):
+    """Drop-in replacement for switch_layers.SwitchGLU on the decode path.
+
+    Expert weights are fetched per call from the cache manager; misses are
+    loaded synchronously from SSD. After computing, the predictor enqueues
+    prefetch for the next layer(s).
+    """
+
+    def __init__(self, layer_idx: int, runtime: "StreamRuntime", bits: int, group_size: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.rt = runtime
+        self.bits = bits
+        self.group_size = group_size
+
+    def _expert_arrays(self, expert_id: int):
+        key = (self.layer_idx, expert_id)
+        arrays = self.rt.cache.get(key)
+        if arrays is None:
+            # if a prefetch for this key is in flight, wait briefly for it
+            deadline = time.monotonic() + 0.05
+            while self.rt.io.wait_idle(key) and time.monotonic() < deadline:
+                arrays = self.rt.cache.get(key)
+                if arrays is not None:
+                    return arrays
+                time.sleep(0.0005)
+            arrays = self.rt.cache.get(key)
+            if arrays is None:
+                self.rt.sync_loads += 1
+                arrays = self.rt.io.load_sync(key)
+                self.rt.cache.put(key, arrays, tier=LRU)
+        return arrays
+
+    def _qmm(self, x, arrays, part):
+        return mx.quantized_matmul(
+            x,
+            arrays[f"{part}.weight"],
+            scales=arrays[f"{part}.scales"],
+            biases=arrays[f"{part}.biases"],
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+        )
+
+    def __call__(self, x, indices) -> mx.array:
+        # x: [..., D], indices: [..., k]
+        *lead, D = x.shape
+        k = indices.shape[-1]
+        xt = x.reshape(-1, D)
+        idx = np.array(indices.reshape(-1, k))  # forces eval of router output
+        T = xt.shape[0]
+
+        out = mx.zeros((T, k, D), dtype=x.dtype)
+        for e in np.unique(idx):
+            rows, slots = np.nonzero(idx == e)
+            arrays = self._expert_arrays(int(e))
+            xe = xt[mx.array(rows)]
+            ye = self._qmm(
+                _swiglu(self._qmm(xe, arrays, "gate_proj"),
+                        self._qmm(xe, arrays, "up_proj")),
+                arrays, "down_proj")
+            out[mx.array(rows), mx.array(slots)] = ye
+
+        self.rt.on_router(self.layer_idx, idx)
+        return out.reshape(*lead, k, D)
+
+
+class StreamRuntime:
+    """Shared state: cache, IO pool, predictor, filler, activation recorder."""
+
+    def __init__(self, shard_root: Path, n_layers: int, n_experts: int,
+                 lru_bytes: int, prefetch_bytes: int, filler_bytes: int,
+                 table_path=None, prefetch_depth: int = 2, prefetch_width: int = 8,
+                 io_threads: int = 4):
+        self.cache = ExpertCache(lru_bytes, prefetch_bytes, filler_bytes)
+        self.io = IOPool(shard_root, self.cache, n_threads=io_threads)
+        self.predictor = Predictor(n_layers, n_experts, table_path)
+        self.prefetch_depth = prefetch_depth
+        self.prefetch_width = prefetch_width
+        self.n_layers = n_layers
+        self.n_experts = n_experts
+        self.sync_loads = 0
+        self.recorder = None  # set by profiler: fn(layer, np_indices)
+        all_keys = [(l, e) for l in range(n_layers) for e in range(n_experts)]
+        self.filler = FillerLoop(all_keys, self.io, self.cache)
+        if filler_bytes > 0:
+            self.filler.start()
+
+    def on_router(self, layer: int, idx: np.ndarray):
+        if self.recorder is not None:
+            self.recorder(layer, idx)
+        active = np.unique(idx).tolist()
+        # chain predictions for depth layers ahead
+        for d in range(1, self.prefetch_depth + 1):
+            preds = self.predictor.predict(layer + d - 1, active, self.prefetch_width)
+            if not preds:
+                break
+            prio = 10.0 / d
+            for rank, e in enumerate(preds):
+                self.io.enqueue((layer + d, e), priority=prio - 0.01 * rank,
+                                tier=PREFETCH)
+            active = preds
+
+    def stats(self):
+        s = self.cache.stats()
+        s["sync_loads"] = self.sync_loads
+        return s
+
+    def stop(self):
+        self.filler.stop()
+        self.io.stop()
+
+
+def load_streamed_model(model_dir: Path, shard_dir: Path, *,
+                        lru_bytes: int, prefetch_bytes: int, filler_bytes: int,
+                        table_path=None, prefetch_depth: int = 2,
+                        prefetch_width: int = 8, io_threads: int = 4):
+    """Load fixed parts into RAM, swap every MoE switch_mlp for the streamed
+    version. Expert weights from the safetensors are never materialized."""
+    from mlx_lm.utils import load_model
+
+    model_dir = Path(model_dir)
+    cfg = json.loads((model_dir / "config.json").read_text())
+    quant = cfg.get("quantization") or cfg.get("quantization_config")
+    text_cfg = cfg.get("text_config", cfg)
+    n_layers = text_cfg["num_hidden_layers"]
+    n_experts = text_cfg["num_experts"]
+
+    model, _ = load_model(model_dir, lazy=True)
+
+    rt = StreamRuntime(Path(shard_dir), n_layers, n_experts,
+                       lru_bytes, prefetch_bytes, filler_bytes,
+                       table_path=table_path, prefetch_depth=prefetch_depth,
+                       prefetch_width=prefetch_width, io_threads=io_threads)
+
+    inner = model.language_model.model if hasattr(model, "language_model") else model.model
+    n_swapped = 0
+    for l, layer in enumerate(inner.layers):
+        mlp = layer.mlp
+        if hasattr(mlp, "switch_mlp"):
+            mlp.switch_mlp = StreamedSwitchGLU(l, rt, quant["bits"], quant["group_size"])
+            n_swapped += 1
+    assert n_swapped == n_layers, f"swapped {n_swapped}/{n_layers} MoE layers"
+
+    mx.eval(model.parameters())  # loads only the fixed (non-expert) weights
+    return model, rt
