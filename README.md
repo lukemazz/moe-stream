@@ -16,6 +16,45 @@ Measured on M4 / 24 GB / NVMe:
 
 ---
 
+## Why this is a big deal
+
+A 35-billion-parameter model is simply **not supposed to run on a 24 GB
+laptop**. The 4-bit checkpoint alone is 19 GB; add the OS, the KV cache and
+the working buffers and the math stops working — by the conventional rules,
+this model belongs on a workstation with 32–64 GB of unified memory, or on a
+GPU server. The standard answers for consumer hardware are all compromises:
+use a much smaller (and dumber) model, quantize so aggressively that quality
+collapses, or let the OS swap and watch generation crawl at seconds per token.
+
+This project takes none of those compromises. The **full 35B model, at a
+healthy 4-bit quantization, runs on a base-spec Mac** — with only ~1.6 GB of
+weights permanently resident and a peak of ~10 GB of RAM — at interactive
+speeds. Nothing about the model was shrunk, distilled or trimmed: all 10,240
+experts are there, fetched from the SSD at the exact moment the router asks
+for them, and increasingly *before* it asks, thanks to predictive prefetching.
+
+What makes this exciting is the shift in perspective it represents:
+
+- **The SSD becomes part of the memory hierarchy.** Modern NVMe storage on
+  Apple Silicon is fast enough (multiple GB/s) that, with the right access
+  pattern — one expert, one sequential read — it can serve as a *lazy tier of
+  RAM* rather than a place where models go to die in swap.
+- **MoE sparsity is turned from a training trick into a deployment
+  superpower.** Only ~3% of the expert weights are needed per token; this
+  system is built entirely around exploiting that asymmetry.
+- **Prediction hides the latency.** The transition table learns the model's
+  own routing habits and overlaps SSD reads with GPU compute, so the
+  bottleneck that should make this approach unusable largely disappears —
+  in our measurements it *doubled* throughput.
+- **It scales with intelligence-per-byte.** The same machinery applies to any
+  MoE checkpoint with this layout: the bigger and sparser the model, the more
+  you gain. The RAM in your laptop stops being the ceiling on the size of the
+  model you can run.
+
+In short: a consumer laptop just ran a model from a weight class it had no
+right to touch, and it did so by being clever about *when* weights are loaded
+rather than ruthless about *which* weights are kept.
+
 ## Why this works: MoE sparsity
 
 In a dense transformer every FFN weight is needed for every token. In an MoE
