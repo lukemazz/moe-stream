@@ -41,20 +41,36 @@ def main():
         prefetch_width=args.prefetch_width, io_threads=args.io_threads)
     tokenizer = load_tokenizer(args.model_dir)
     print(f"Pronto. RAM fissa: {mx.get_active_memory()/1e9:.2f} GB. "
-          f"Comandi: /stats /reset /quit\n")
+          f"Comandi: /stats /reset /effort high|low /quit "
+          f"(Ctrl+C ferma la generazione)\n")
 
     prompt_cache = make_prompt_cache(model)
+    thinking = True  # effort: high = thinking abilitato, low = disabilitato
 
     while True:
         try:
             user = input("tu> ").strip()
-        except (EOFError, KeyboardInterrupt):
+        except KeyboardInterrupt:
+            print("\n(usa /quit o Ctrl+D per uscire)")
+            continue
+        except EOFError:
             print()
             break
         if not user:
             continue
         if user == "/quit":
             break
+        if user.startswith("/effort"):
+            arg = user.removeprefix("/effort").strip().lower()
+            if arg in ("high", "on"):
+                thinking = True
+            elif arg in ("low", "off"):
+                thinking = False
+            else:
+                print("uso: /effort high|low")
+                continue
+            print(f"(effort: {'high — thinking abilitato' if thinking else 'low — thinking disabilitato'})")
+            continue
         if user == "/stats":
             print(json.dumps(rt.stats(), indent=2))
             print(f"RAM attiva: {mx.get_active_memory()/1e9:.2f} GB, "
@@ -68,16 +84,20 @@ def main():
         # persistent KV cache holds the whole conversation; feed only the new turn
         new_tokens = tokenizer.apply_chat_template(
             [{"role": "user", "content": user}],
-            add_generation_prompt=True, tokenize=True)
+            add_generation_prompt=True, tokenize=True,
+            enable_thinking=thinking)
 
         n_tok = 0
         t0 = time.time()
         print("ai> ", end="", flush=True)
-        for resp in stream_generate(model, tokenizer, new_tokens,
-                                    max_tokens=args.max_tokens,
-                                    prompt_cache=prompt_cache):
-            print(resp.text, end="", flush=True)
-            n_tok += 1
+        try:
+            for resp in stream_generate(model, tokenizer, new_tokens,
+                                        max_tokens=args.max_tokens,
+                                        prompt_cache=prompt_cache):
+                print(resp.text, end="", flush=True)
+                n_tok += 1
+        except KeyboardInterrupt:
+            print("\n   [generazione interrotta]", end="")
         dt = time.time() - t0
         print(f"\n   [{n_tok} token, {n_tok/dt:.2f} tok/s]\n")
 

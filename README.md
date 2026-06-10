@@ -138,8 +138,10 @@ python -m moe_stream.chat MODEL_DIR ./experts --table transition_table.npy
 ```
 
 Multi-turn conversation with a persistent KV cache (each turn extends the
-previous one — no re-prefill of the history). In-chat commands: `/stats`
-(cache hit rates, RAM), `/reset`, `/quit`.
+previous one — no re-prefill of the history). **Ctrl+C stops the current
+generation** without leaving the chat. In-chat commands: `/stats` (cache hit
+rates, RAM), `/effort high|low` (enable/disable the model's thinking mode),
+`/reset`, `/quit`.
 
 ### One-shot generation / benchmark
 
