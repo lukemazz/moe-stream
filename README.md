@@ -196,3 +196,6 @@ run.sh, chat.sh launchers
 
 Inspired by activation-aware expert offloading work such as PowerInfer (SJTU)
 and the MLX expert-streaming ecosystem.
+
+
+Note: this app is partially vibe-coded with claude fable5, if you notice a bug please report it.
