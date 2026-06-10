@@ -16,6 +16,8 @@ Measured on M4 / 24 GB / NVMe:
   + hybrid gather_qmm dispatch          up to 5.5 tok/s decode,
                                         ~77 tok/s prefill (1.2k-token prompt)
   + all-LRU split (filler off, default) 7.2 tok/s decode, 96.3% hit rate
+  + async deferred lookahead + decode
+    fast path (no per-layer syncs)      ~13 tok/s decode (warm cache)
 ```
 
 ---

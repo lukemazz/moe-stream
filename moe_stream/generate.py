@@ -48,6 +48,11 @@ def main():
     print(f"budgets: LRU={lru_b/1e9:.1f}GB prefetch={pre_b/1e9:.1f}GB "
           f"filler={fill_b/1e9:.1f}GB")
 
+    try:
+        mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
+    except Exception:
+        pass
+
     t0 = time.time()
     model, rt = load_streamed_model(
         args.model_dir, args.shard_dir,

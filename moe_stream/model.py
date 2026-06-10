@@ -98,10 +98,10 @@ class StreamedSwitchGLU(nn.Module):
             ys = []
             for e in idx[0]:
                 arrays = self._expert_arrays(int(e))
-                ys.append(self._qmm(
-                    _swiglu(self._qmm(xt, arrays, "gate_proj"),
-                            self._qmm(xt, arrays, "up_proj")),
-                    arrays, "down_proj"))
+                gu = self._qmm(xt, arrays, "gateup_proj")
+                h = gu.shape[-1] // 2
+                ys.append(self._qmm(_swiglu(gu[..., :h], gu[..., h:]),
+                                    arrays, "down_proj"))
             return mx.stack(ys, axis=1).reshape(*lead, k, D)
 
         if T * k <= 4096:
@@ -110,10 +110,10 @@ class StreamedSwitchGLU(nn.Module):
                 rows, slots = np.nonzero(idx == e)
                 arrays = self._expert_arrays(int(e))
                 xe = xt[mx.array(rows)]
-                ye = self._qmm(
-                    _swiglu(self._qmm(xe, arrays, "gate_proj"),
-                            self._qmm(xe, arrays, "up_proj")),
-                    arrays, "down_proj")
+                gu = self._qmm(xe, arrays, "gateup_proj")
+                h = gu.shape[-1] // 2
+                ye = self._qmm(_swiglu(gu[..., :h], gu[..., h:]),
+                               arrays, "down_proj")
                 out[mx.array(rows), mx.array(slots)] = ye
             return out.reshape(*lead, k, D)
 
@@ -124,10 +124,10 @@ class StreamedSwitchGLU(nn.Module):
         ridx = mx.array(inv.reshape(T, k).astype(np.uint32))
 
         xe = xt.reshape(T, 1, 1, D)
-        y = self._gather_qmm(
-            _swiglu(self._gather_qmm(xe, stacked, "gate_proj", ridx),
-                    self._gather_qmm(xe, stacked, "up_proj", ridx)),
-            stacked, "down_proj", ridx)
+        gu = self._gather_qmm(xe, stacked, "gateup_proj", ridx)
+        h = gu.shape[-1] // 2
+        y = self._gather_qmm(_swiglu(gu[..., :h], gu[..., h:]),
+                             stacked, "down_proj", ridx)
 
         return y.squeeze(-2).reshape(*lead, k, D)
 

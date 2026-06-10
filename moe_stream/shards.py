@@ -81,7 +81,10 @@ def write_shard(path: Path, layer: int, expert: int, arrays: dict, bits: int, gr
 
 
 def read_shard(path: Path):
-    """Returns (header_dict, {name: mx.array})."""
+    """Returns (header_dict, {name: mx.array}).
+
+    gate_proj and up_proj are merged into a single "gateup_proj" matrix
+    (gate rows first) so each expert costs 2 matmuls instead of 3."""
     with open(path, "rb") as f:
         data = f.read()
     assert data[:4] == MAGIC, f"bad magic in {path}"
@@ -97,6 +100,9 @@ def read_shard(path: Path):
         if e["dtype"] == "bfloat16":
             a = a.view(mx.bfloat16)
         out[e["name"]] = a
+    for comp in COMPONENTS:
+        out[f"gateup_proj.{comp}"] = mx.concatenate(
+            [out.pop(f"gate_proj.{comp}"), out.pop(f"up_proj.{comp}")], axis=0)
     return header, out
 
 
