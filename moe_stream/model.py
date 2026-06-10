@@ -64,6 +64,18 @@ class StreamedSwitchGLU(nn.Module):
             bits=self.bits,
         )
 
+    def _gather_qmm(self, x, stacked, part, rhs_indices):
+        return mx.gather_qmm(
+            x,
+            stacked[f"{part}.weight"],
+            stacked[f"{part}.scales"],
+            stacked[f"{part}.biases"],
+            rhs_indices=rhs_indices,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+        )
+
     def __call__(self, x, indices) -> mx.array:
         # x: [..., D], indices: [..., k]
         *lead, D = x.shape
@@ -76,18 +88,37 @@ class StreamedSwitchGLU(nn.Module):
         # experts, so SSD IO overlaps with the GPU work below
         self.rt.prefetch_hook(self.layer_idx, xt, idx)
 
-        out = mx.zeros((T, k, D), dtype=x.dtype)
-        for e in np.unique(idx):
-            rows, slots = np.nonzero(idx == e)
-            arrays = self._expert_arrays(int(e))
-            xe = xt[mx.array(rows)]
-            ye = self._qmm(
-                _swiglu(self._qmm(xe, arrays, "gate_proj"),
-                        self._qmm(xe, arrays, "up_proj")),
-                arrays, "down_proj")
-            out[mx.array(rows), mx.array(slots)] = ye
+        # Hybrid dispatch. Decode (few tokens): loop over the k experts with
+        # plain quantized_matmul — stacking weights would cost more in copies
+        # than it saves in kernel launches. Prefill (many tokens): stack the
+        # active experts once and run three batched gather_qmm kernels, where
+        # the copy is amortized over all tokens.
+        if T * k <= 4096:
+            out = mx.zeros((T, k, D), dtype=x.dtype)
+            for e in np.unique(idx):
+                rows, slots = np.nonzero(idx == e)
+                arrays = self._expert_arrays(int(e))
+                xe = xt[mx.array(rows)]
+                ye = self._qmm(
+                    _swiglu(self._qmm(xe, arrays, "gate_proj"),
+                            self._qmm(xe, arrays, "up_proj")),
+                    arrays, "down_proj")
+                out[mx.array(rows), mx.array(slots)] = ye
+            return out.reshape(*lead, k, D)
 
-        return out.reshape(*lead, k, D)
+        uniq, inv = np.unique(idx, return_inverse=True)
+        experts = [self._expert_arrays(int(e)) for e in uniq]
+        stacked = {name: mx.stack([e[name] for e in experts])
+                   for name in experts[0]}
+        ridx = mx.array(inv.reshape(T, k).astype(np.uint32))
+
+        xe = xt.reshape(T, 1, 1, D)
+        y = self._gather_qmm(
+            _swiglu(self._gather_qmm(xe, stacked, "gate_proj", ridx),
+                    self._gather_qmm(xe, stacked, "up_proj", ridx)),
+            stacked, "down_proj", ridx)
+
+        return y.squeeze(-2).reshape(*lead, k, D)
 
 
 class StreamRuntime:

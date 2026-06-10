@@ -62,11 +62,14 @@ def main():
 
     n_tok = 0
     t0 = time.time()
+    resp = None
     for resp in stream_generate(model, tokenizer, text, max_tokens=args.max_tokens):
         print(resp.text, end="", flush=True)
         n_tok += 1
     dt = time.time() - t0
     print(f"\n\n--- {n_tok} tokens in {dt:.1f}s = {n_tok/dt:.2f} tok/s")
+    if resp is not None:
+        print(f"prefill: {resp.prompt_tokens} tokens at {resp.prompt_tps:.1f} tok/s")
     print(json.dumps(rt.stats(), indent=2))
     print(f"peak RAM: {mx.get_peak_memory()/1e9:.2f} GB")
     rt.stop()

@@ -13,6 +13,8 @@ Measured on M4 / 24 GB / NVMe:
   LRU cache only (no prediction)        1.8 tok/s   (45% cache hit rate)
   + transition-table prefetch + filler  3.7 tok/s   (61%+)
   + router lookahead (pre-gating)       3.9 tok/s   (up to 89% hit rate)
+  + hybrid gather_qmm dispatch          up to 5.5 tok/s decode,
+                                        ~77 tok/s prefill (1.2k-token prompt)
 ```
 
 ---
