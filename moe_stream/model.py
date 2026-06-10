@@ -121,6 +121,28 @@ class StreamedSwitchGLU(nn.Module):
         return y.squeeze(-2).reshape(*lead, k, D)
 
 
+class _EmbedHook(nn.Module):
+    """Cross-token prefetch: as soon as the freshly sampled token is embedded,
+    predict the experts for the first layers by applying their routers to the
+    embedding (the residual stream at the start of the network is dominated by
+    it), so SSD loads overlap with layer-0 attention instead of stalling the
+    first MoE layers cold."""
+
+    def __init__(self, embed, rt: "StreamRuntime"):
+        super().__init__()
+        self.embed = embed
+        self.rt = rt
+
+    def __call__(self, x):
+        y = self.embed(x)
+        if y.size // y.shape[-1] <= 8:  # decode only; prefill warms itself
+            self.rt.lookahead_from(-1, y.reshape(-1, y.shape[-1]))
+        return y
+
+    def as_linear(self, x):
+        return self.embed.as_linear(x)
+
+
 class StreamRuntime:
     """Shared state: cache, IO pool, predictor, filler, activation recorder."""
 
@@ -152,17 +174,23 @@ class StreamRuntime:
         else:
             self._table_prefetch(layer, idx)
 
+    def lookahead_from(self, layer: int, xt: mx.array):
+        if self.use_lookahead and self.gates is not None:
+            self._lookahead(layer, xt)
+
     def _lookahead(self, layer: int, xt: mx.array):
         """Router lookahead (pre-gating): apply the routers of the next layers
         to the current hidden state. The residual stream changes slowly across
         adjacent layers, so this predicts upcoming experts far better than
         static co-occurrence statistics."""
         w = self.prefetch_width
-        for d in range(1, self.prefetch_depth + 1):
+        depth = self.prefetch_depth if layer >= 0 else 2
+        for d in range(1, depth + 1):
             nxt = layer + d
             if nxt >= self.n_layers or self.gates[nxt] is None:
                 break
-            scores = mx.softmax(self.gates[nxt](xt), axis=-1).sum(axis=0)
+            # raw logits: softmax is monotonic, ranking does not need it
+            scores = self.gates[nxt](xt).sum(axis=0)
             preds = np.array(mx.argpartition(scores, kth=-w)[-w:])
             prio = 10.0 / d
             for rank, e in enumerate(preds.tolist()):
@@ -227,6 +255,7 @@ def load_streamed_model(model_dir: Path, shard_dir: Path, *,
             gates.append(None)
     assert n_swapped == n_layers, f"swapped {n_swapped}/{n_layers} MoE layers"
     rt.gates = gates
+    inner.embed_tokens = _EmbedHook(inner.embed_tokens, rt)
 
     mx.eval(model.parameters())  # loads only the fixed (non-expert) weights
     return model, rt
