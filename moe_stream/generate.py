@@ -37,9 +37,9 @@ def main():
     p.add_argument("--context-k", type=int, default=4)
     p.add_argument("--table", type=Path, default=None,
                    help="transition_table.npy from the profiler")
-    p.add_argument("--prefetch-depth", type=int, default=2)
-    p.add_argument("--prefetch-width", type=int, default=8)
-    p.add_argument("--io-threads", type=int, default=4)
+    p.add_argument("--prefetch-depth", type=int, default=3)
+    p.add_argument("--prefetch-width", type=int, default=16)
+    p.add_argument("--io-threads", type=int, default=8)
     args = p.parse_args()
 
     lru_b, pre_b, fill_b = budget_split(args.ram_gb, args.context_k)

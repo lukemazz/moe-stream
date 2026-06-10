@@ -72,6 +72,10 @@ class StreamedSwitchGLU(nn.Module):
         idx = np.array(indices.reshape(-1, k))  # forces eval of router output
         T = xt.shape[0]
 
+        # enqueue prefetch for the next layers BEFORE computing this layer's
+        # experts, so SSD IO overlaps with the GPU work below
+        self.rt.prefetch_hook(self.layer_idx, xt, idx)
+
         out = mx.zeros((T, k, D), dtype=x.dtype)
         for e in np.unique(idx):
             rows, slots = np.nonzero(idx == e)
@@ -83,7 +87,6 @@ class StreamedSwitchGLU(nn.Module):
                 arrays, "down_proj")
             out[mx.array(rows), mx.array(slots)] = ye
 
-        self.rt.on_router(self.layer_idx, idx)
         return out.reshape(*lead, k, D)
 
 
@@ -103,14 +106,39 @@ class StreamRuntime:
         self.n_experts = n_experts
         self.sync_loads = 0
         self.recorder = None  # set by profiler: fn(layer, np_indices)
+        self.gates = None  # routers of all layers, set by load_streamed_model
+        self.use_lookahead = True
         all_keys = [(l, e) for l in range(n_layers) for e in range(n_experts)]
         self.filler = FillerLoop(all_keys, self.io, self.cache)
         if filler_bytes > 0:
             self.filler.start()
 
-    def on_router(self, layer: int, idx: np.ndarray):
+    def prefetch_hook(self, layer: int, xt: mx.array, idx: np.ndarray):
         if self.recorder is not None:
             self.recorder(layer, idx)
+        if self.use_lookahead and self.gates is not None:
+            self._lookahead(layer, xt)
+        else:
+            self._table_prefetch(layer, idx)
+
+    def _lookahead(self, layer: int, xt: mx.array):
+        """Router lookahead (pre-gating): apply the routers of the next layers
+        to the current hidden state. The residual stream changes slowly across
+        adjacent layers, so this predicts upcoming experts far better than
+        static co-occurrence statistics."""
+        w = self.prefetch_width
+        for d in range(1, self.prefetch_depth + 1):
+            nxt = layer + d
+            if nxt >= self.n_layers or self.gates[nxt] is None:
+                break
+            scores = mx.softmax(self.gates[nxt](xt), axis=-1).sum(axis=0)
+            preds = np.array(mx.argpartition(scores, kth=-w)[-w:])
+            prio = 10.0 / d
+            for rank, e in enumerate(preds.tolist()):
+                self.io.enqueue((nxt, e), priority=prio - 0.01 * rank,
+                                tier=PREFETCH)
+
+    def _table_prefetch(self, layer: int, idx: np.ndarray):
         active = np.unique(idx).tolist()
         # chain predictions for depth layers ahead
         for d in range(1, self.prefetch_depth + 1):
@@ -157,12 +185,17 @@ def load_streamed_model(model_dir: Path, shard_dir: Path, *,
 
     inner = model.language_model.model if hasattr(model, "language_model") else model.model
     n_swapped = 0
+    gates = []
     for l, layer in enumerate(inner.layers):
         mlp = layer.mlp
         if hasattr(mlp, "switch_mlp"):
             mlp.switch_mlp = StreamedSwitchGLU(l, rt, quant["bits"], quant["group_size"])
             n_swapped += 1
+            gates.append(mlp.gate)
+        else:
+            gates.append(None)
     assert n_swapped == n_layers, f"swapped {n_swapped}/{n_layers} MoE layers"
+    rt.gates = gates
 
     mx.eval(model.parameters())  # loads only the fixed (non-expert) weights
     return model, rt

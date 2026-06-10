@@ -11,7 +11,8 @@ weights resident in memory.
 ```
 Measured on M4 / 24 GB / NVMe:
   LRU cache only (no prediction)        1.8 tok/s   (45% cache hit rate)
-  + predictive prefetch + filler cache  3.7 tok/s   (61%+, keeps rising)
+  + transition-table prefetch + filler  3.7 tok/s   (61%+)
+  + router lookahead (pre-gating)       3.9 tok/s   (up to 89% hit rate)
 ```
 
 ---
@@ -115,11 +116,16 @@ one `read()` — no seeks, no read amplification.
 
 1. **LRU cache** (reactive). Recently used experts. Exploits temporal locality:
    experts used for recent tokens tend to fire again.
-2. **Prefetch staging** (predictive). While the GPU computes layer *N*, a
-   **transition table** — `P(expert j active at layer N+1 | expert i active at
-   layer N)`, built offline by profiling the model on a small corpus — ranks
-   the experts most likely needed at layer *N+1* (and *N+2*, chained), and the
-   IO pool loads them at high priority in parallel with compute.
+2. **Prefetch staging** (predictive). While the GPU computes layer *N*, the
+   experts most likely needed at the next layers are loaded at high priority,
+   in parallel with compute. Prediction uses **router lookahead
+   (pre-gating)**: the routers of layers *N+1..N+depth* — tiny, always
+   resident — are applied directly to the current hidden state. Because the
+   residual stream changes slowly across adjacent layers, this predicts
+   upcoming experts with high accuracy (~89% end-to-end cache hit rate in our
+   tests). A statistical **transition table** built offline by
+   `moe_stream.profiler` is used as automatic fallback when lookahead is
+   disabled (`rt.use_lookahead = False`).
 3. **Filler cache** (opportunistic). Any leftover RAM is filled in the
    background with *randomly chosen* experts. Expert activation is far from
    uniform, so a random resident expert has a better-than-uniform chance of
@@ -200,9 +206,9 @@ edit the variables at the top to match your machine.
 |---|---|---|
 | `--ram-gb` | 24 | total machine RAM; drives the budget calculator |
 | `--context-k` | 4/8 | context length (k tokens); reserves KV-cache RAM |
-| `--prefetch-depth` | 2 | how many layers ahead to predict |
-| `--prefetch-width` | 8 | experts prefetched per predicted layer |
-| `--io-threads` | 4 | SSD reader threads |
+| `--prefetch-depth` | 3 | how many layers ahead to predict |
+| `--prefetch-width` | 16 | experts prefetched per predicted layer |
+| `--io-threads` | 8 | SSD reader threads |
 
 RAM budget split (after subtracting OS, fixed weights, KV cache, safety
 margin): 27% LRU, 9% prefetch staging, 64% filler.
