@@ -93,6 +93,17 @@ class StreamedSwitchGLU(nn.Module):
         # than it saves in kernel launches. Prefill (many tokens): stack the
         # active experts once and run three batched gather_qmm kernels, where
         # the copy is amortized over all tokens.
+        if T == 1:
+            # single token: router experts are distinct, no scatter needed
+            ys = []
+            for e in idx[0]:
+                arrays = self._expert_arrays(int(e))
+                ys.append(self._qmm(
+                    _swiglu(self._qmm(xt, arrays, "gate_proj"),
+                            self._qmm(xt, arrays, "up_proj")),
+                    arrays, "down_proj"))
+            return mx.stack(ys, axis=1).reshape(*lead, k, D)
+
         if T * k <= 4096:
             out = mx.zeros((T, k, D), dtype=x.dtype)
             for e in np.unique(idx):
@@ -161,6 +172,10 @@ class StreamRuntime:
         self.recorder = None  # set by profiler: fn(layer, np_indices)
         self.gates = None  # routers of all layers, set by load_streamed_model
         self.use_lookahead = True
+        # deferred lookahead pipeline: scores are scheduled with async_eval
+        # and read back (numpy) one layer later, when they are already
+        # computed, keeping graph syncs off the decode critical path
+        self._la_pending: list[tuple[int, mx.array]] = []
         all_keys = [(l, e) for l in range(n_layers) for e in range(n_experts)]
         self.filler = FillerLoop(all_keys, self.io, self.cache)
         if filler_bytes > 0:
@@ -170,7 +185,7 @@ class StreamRuntime:
         if self.recorder is not None:
             self.recorder(layer, idx)
         if self.use_lookahead and self.gates is not None:
-            self._lookahead(layer, xt)
+            self.lookahead_from(layer, xt)
         else:
             self._table_prefetch(layer, idx)
 
@@ -182,20 +197,32 @@ class StreamRuntime:
         """Router lookahead (pre-gating): apply the routers of the next layers
         to the current hidden state. The residual stream changes slowly across
         adjacent layers, so this predicts upcoming experts far better than
-        static co-occurrence statistics."""
+        static co-occurrence statistics. The top-k index arrays are scheduled
+        asynchronously and consumed on the next call, when the GPU has already
+        produced them — the numpy readback then costs ~nothing."""
+        # 1. drain predictions scheduled on the previous layer
+        for nxt, d, preds_arr in self._la_pending:
+            prio = 10.0 / d
+            for rank, e in enumerate(np.array(preds_arr).tolist()):
+                self.io.enqueue((nxt, e), priority=prio - 0.01 * rank,
+                                tier=PREFETCH)
+        self._la_pending.clear()
+
+        # 2. schedule this layer's predictions without syncing
         w = self.prefetch_width
         depth = self.prefetch_depth if layer >= 0 else 2
+        scheduled = []
         for d in range(1, depth + 1):
             nxt = layer + d
             if nxt >= self.n_layers or self.gates[nxt] is None:
                 break
             # raw logits: softmax is monotonic, ranking does not need it
             scores = self.gates[nxt](xt).sum(axis=0)
-            preds = np.array(mx.argpartition(scores, kth=-w)[-w:])
-            prio = 10.0 / d
-            for rank, e in enumerate(preds.tolist()):
-                self.io.enqueue((nxt, e), priority=prio - 0.01 * rank,
-                                tier=PREFETCH)
+            preds = mx.argpartition(scores, kth=-w)[-w:]
+            scheduled.append((nxt, d, preds))
+        if scheduled:
+            mx.async_eval([p for _, _, p in scheduled])
+            self._la_pending = scheduled
 
     def _table_prefetch(self, layer: int, idx: np.ndarray):
         active = np.unique(idx).tolist()
