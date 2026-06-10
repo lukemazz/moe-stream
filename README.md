@@ -241,11 +241,12 @@ The printed path is your `MODEL_DIR`.
 python -m moe_stream.shards MODEL_DIR ./experts
 ```
 
-### 3. (Optional but recommended) Build the transition table
+### 3. (Optional) Build the transition table
 
 Profiles the model on a small built-in corpus and writes
-`transition_table.npy`. Without it, prefetching is disabled and you fall back
-to LRU + filler only.
+`transition_table.npy`. The table is only used as a fallback when router
+lookahead is disabled — with the default settings (lookahead on) you can
+skip this step without losing prefetching.
 
 ```bash
 python -m moe_stream.profiler MODEL_DIR ./experts -o transition_table.npy
@@ -294,6 +295,7 @@ margin) is controlled by `--split lru,prefetch,filler`; default
 ```
 moe_stream/
   shards.py     expert shard format + safetensors → per-expert .bin converter
+                (merges gate/up into a single gateup matrix at load)
   cache.py      three-tier cache (LRU / prefetch / filler), strict eviction order
   io_pool.py    priority-queue thread pool + background filler loop
   predictor.py  transition-table next-layer expert prediction
@@ -301,6 +303,8 @@ moe_stream/
   model.py      MLX wrapper: swaps each MoE SwitchGLU for a streamed version
   generate.py   one-shot generation CLI with stats
   chat.py       interactive multi-turn chat (persistent KV cache)
+tools/
+  bench_breakdown.py  per-stage decode benchmark used for the measurements
 run.sh, chat.sh launchers
 ```
 
