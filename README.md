@@ -89,7 +89,7 @@ subsystems, so the overlap is real.
                        ┌──────────────────────┐
                        │   MoE layer forward  │
                        └──────────┬───────────┘
-                                  │ lookup: LRU → prefetch → filler → SSD
+                                  │ lookup: LRU → prefetch → (filler) → SSD
                        ┌──────────▼───────────┐
                        │  three-tier cache    │
                        │  (ExpertCache)       │
@@ -98,7 +98,7 @@ subsystems, so the overlap is real.
    ┌────────▼────────┐  ┌─────────▼────────┐  ┌─────────▼────────┐
    │ LRU cache       │  │ prefetch staging │  │ filler cache     │
    │ recent experts  │  │ predicted experts│  │ random warm fill │
-   │ evicted last    │  │                  │  │ evicted FIRST    │
+   │ evicted last    │  │                  │  │ (OFF by default) │
    └─────────────────┘  └─────────┬────────┘  └─────────┬────────┘
                         ┌─────────▼─────────────────────▼────────┐
                         │  async IO thread pool (priority queue) │
@@ -143,6 +143,8 @@ one `read()` — no seeks, no read amplification.
 
 Strict eviction order: **filler → prefetch → LRU**. Lookup order on the hot
 path: **LRU → prefetch → filler → SSD (sync load, counted as a miss)**.
+With the default split the filler tier is empty, so in practice the lookup
+is LRU → prefetch → SSD.
 
 The transition table is tiny (40×256×256 float16 ≈ 5 MB) and pays for itself
 immediately: in our tests it roughly doubled throughput.
