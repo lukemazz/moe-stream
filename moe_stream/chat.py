@@ -30,9 +30,12 @@ def main():
     p.add_argument("--prefetch-depth", type=int, default=3)
     p.add_argument("--prefetch-width", type=int, default=16)
     p.add_argument("--io-threads", type=int, default=8)
+    p.add_argument("--split", default="0.87,0.13,0.0",
+                   help="RAM fractions for lru,prefetch,filler")
     args = p.parse_args()
 
-    lru_b, pre_b, fill_b = budget_split(args.ram_gb, args.context_k)
+    fracs = tuple(float(x) for x in args.split.split(","))
+    lru_b, pre_b, fill_b = budget_split(args.ram_gb, args.context_k, fracs)
     print("Caricamento modello (parti fisse)...", flush=True)
     model, rt = load_streamed_model(
         args.model_dir, args.shard_dir,

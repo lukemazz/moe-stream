@@ -12,14 +12,13 @@ from pathlib import Path
 import mlx.core as mx
 
 
-def budget_split(total_ram_gb: float, context_k: int):
-    """Spec section 9 memory budget calculator."""
+def budget_split(total_ram_gb: float, context_k: int,
+                 fractions=(0.27, 0.09, 0.64)):
+    """Spec section 9 memory budget calculator. fractions = (lru, prefetch, filler)."""
     avail = total_ram_gb - 4 - 4 - 0.125 * context_k - 1
     avail = max(avail, 1.0)
     gb = 1 << 30
-    return (int(avail * 0.27 * gb),   # LRU
-            int(avail * 0.09 * gb),   # prefetch staging
-            int(avail * 0.64 * gb))   # filler
+    return tuple(int(avail * f * gb) for f in fractions)
 
 
 def main():
@@ -40,9 +39,12 @@ def main():
     p.add_argument("--prefetch-depth", type=int, default=3)
     p.add_argument("--prefetch-width", type=int, default=16)
     p.add_argument("--io-threads", type=int, default=8)
+    p.add_argument("--split", default="0.87,0.13,0.0",
+                   help="RAM fractions for lru,prefetch,filler")
     args = p.parse_args()
 
-    lru_b, pre_b, fill_b = budget_split(args.ram_gb, args.context_k)
+    fracs = tuple(float(x) for x in args.split.split(","))
+    lru_b, pre_b, fill_b = budget_split(args.ram_gb, args.context_k, fracs)
     print(f"budgets: LRU={lru_b/1e9:.1f}GB prefetch={pre_b/1e9:.1f}GB "
           f"filler={fill_b/1e9:.1f}GB")
 

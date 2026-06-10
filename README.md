@@ -15,6 +15,7 @@ Measured on M4 / 24 GB / NVMe:
   + router lookahead (pre-gating)       3.9 tok/s   (up to 89% hit rate)
   + hybrid gather_qmm dispatch          up to 5.5 tok/s decode,
                                         ~77 tok/s prefill (1.2k-token prompt)
+  + all-LRU split (filler off, default) 7.2 tok/s decode, 96.3% hit rate
 ```
 
 ---
@@ -128,11 +129,13 @@ one `read()` — no seeks, no read amplification.
    tests). A statistical **transition table** built offline by
    `moe_stream.profiler` is used as automatic fallback when lookahead is
    disabled (`rt.use_lookahead = False`).
-3. **Filler cache** (opportunistic). Any leftover RAM is filled in the
-   background with *randomly chosen* experts. Expert activation is far from
-   uniform, so a random resident expert has a better-than-uniform chance of
-   being useful — and it costs nothing, because filler entries have the lowest
-   priority and are always evicted first.
+3. **Filler cache** (opportunistic, disabled by default). Leftover RAM can be
+   filled in the background with *randomly chosen* experts. A/B testing showed
+   that giving that RAM to the LRU instead beats random fill (96.3% vs 92.0%
+   hit rate, +10% tok/s on long generations, −41% sync SSD loads): the LRU
+   keeps the experts that are *actually* hot rather than a random sample. The
+   default split is therefore 87% LRU / 13% prefetch / 0% filler; pass e.g.
+   `--split 0.27,0.09,0.64` to re-enable the filler tier.
 
 Strict eviction order: **filler → prefetch → LRU**. Lookup order on the hot
 path: **LRU → prefetch → filler → SSD (sync load, counted as a miss)**.
@@ -213,7 +216,8 @@ edit the variables at the top to match your machine.
 | `--io-threads` | 8 | SSD reader threads |
 
 RAM budget split (after subtracting OS, fixed weights, KV cache, safety
-margin): 27% LRU, 9% prefetch staging, 64% filler.
+margin) is controlled by `--split lru,prefetch,filler`; default
+`0.87,0.13,0.0` (filler disabled — a big LRU measured faster).
 
 ## Repository layout
 
