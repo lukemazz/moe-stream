@@ -16,6 +16,64 @@ def entry_bytes(arrays: dict) -> int:
     return sum(a.nbytes for a in arrays.values())
 
 
+class DecodeArena:
+    """Per-layer stacked expert buffers for single-dispatch decode (gather_qmm).
+
+    Each layer owns preallocated tensors [H, ...] per weight name plus an
+    expert->slot LRU map. Inserting an expert copies its tensors into a slot
+    once; from then on decode addresses it by slot index, so the k active
+    experts of a layer run as ONE gather_qmm per projection instead of k
+    quantized_matmul launches. All mutation happens on the decode thread; the
+    slice-assign follows the KV-cache in-place update pattern (scatter with
+    buffer donation), so steady-state inserts do not copy the whole buffer.
+    """
+
+    def __init__(self, n_layers: int, total_bytes: int):
+        self.n_layers = n_layers
+        self.total_bytes = total_bytes
+        self.h = 0  # slots per layer, sized on first insert from expert nbytes
+        self.layers = [None] * n_layers  # layer -> {name: stacked buffer}
+        self.maps = [OrderedDict() for _ in range(n_layers)]  # expert -> slot
+        self.hits = 0
+        self.inserts = 0
+
+    def lookup(self, layer: int, expert: int):
+        m = self.maps[layer]
+        slot = m.get(expert)
+        if slot is not None:
+            m.move_to_end(expert)
+            self.hits += 1
+        return slot
+
+    def contains(self, layer: int, expert: int) -> bool:
+        return expert in self.maps[layer]
+
+    def insert(self, layer: int, expert: int, arrays: dict) -> int:
+        import mlx.core as mx
+        if self.h == 0:
+            self.h = max(8, int(self.total_bytes
+                                // (self.n_layers * entry_bytes(arrays))))
+        bufs = self.layers[layer]
+        if bufs is None:
+            bufs = {name: mx.zeros((self.h, *a.shape), dtype=a.dtype)
+                    for name, a in arrays.items()}
+            self.layers[layer] = bufs
+        m = self.maps[layer]
+        if len(m) < self.h:
+            slot = len(m)
+        else:
+            _, slot = m.popitem(last=False)  # reuse the LRU slot
+        for name, a in arrays.items():
+            bufs[name][slot] = a
+        m[expert] = slot
+        self.inserts += 1
+        return slot
+
+    def stats(self) -> dict:
+        return {"arena_hits": self.hits, "arena_inserts": self.inserts,
+                "arena_slots_per_layer": self.h}
+
+
 class ExpertCache:
     def __init__(self, lru_bytes: int, prefetch_bytes: int, filler_bytes: int):
         self.lock = threading.Lock()
@@ -50,6 +108,16 @@ class ExpertCache:
     def contains(self, key) -> bool:
         with self.lock:
             return any(key in self.tiers[t] for t in (LRU, PREFETCH, FILLER))
+
+    def remove(self, key):
+        """Drop an entry from whatever tier holds it (no hit/miss counted).
+        Used when an expert moves to the decode arena, so it is not held twice."""
+        with self.lock:
+            for tier in (LRU, PREFETCH, FILLER):
+                d = self.tiers[tier]
+                if key in d:
+                    self.used[tier] -= entry_bytes(d.pop(key))
+                    return
 
     def put(self, key, arrays, tier=LRU):
         nb = entry_bytes(arrays)

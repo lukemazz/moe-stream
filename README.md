@@ -5,8 +5,10 @@ weights from the SSD, with predictive prefetching that loads experts *before*
 the model needs them.
 
 Reference setup: **Qwen3.6-35B-A3B 4-bit MLX (19 GB)** running on a **24 GB**
-Apple Silicon Mac with a peak RAM usage of ~10 GB and only ~1.6 GB of fixed
-weights resident in memory.
+Apple Silicon Mac with only ~1.6 GB of fixed weights resident in memory. Peak
+RAM follows the cache budget you give it: ~16 GB with the default (fastest)
+settings, less with a smaller `--ram-gb` at the cost of hit rate — speed and
+RAM are a trade-off, not two independent headlines.
 
 ```
 Measured on M4 / 24 GB / NVMe:
@@ -20,6 +22,8 @@ Measured on M4 / 24 GB / NVMe:
   + deferred async lookahead            11.1 tok/s
   + scatter-free T=1 decode path        12.1 tok/s
   + merged gate/up projections          12.8 tok/s cold / ~13 tok/s warm
+  + decode arena (gather_qmm at T=1)    ~12.4 tok/s one-shot,
+                                        19-22 tok/s warm multi-turn chat
 ```
 
 ---
@@ -36,8 +40,8 @@ collapses, or let the OS swap and watch generation crawl at seconds per token.
 
 This project takes none of those compromises. The **full 35B model, at a
 healthy 4-bit quantization, runs on a base-spec Mac** — with only ~1.6 GB of
-weights permanently resident and a peak of ~10 GB of RAM — at interactive
-speeds. Nothing about the model was shrunk, distilled or trimmed: all 10,240
+weights permanently resident and a cache-budget-bounded peak (~16 GB at the
+default settings) — at interactive speeds. Nothing about the model was shrunk, distilled or trimmed: all 10,240
 experts are there, fetched from the SSD at the exact moment the router asks
 for them, and increasingly *before* it asks, thanks to predictive prefetching.
 
@@ -146,12 +150,25 @@ path: **LRU → prefetch → filler → SSD (sync load, counted as a miss)**.
 With the default split the filler tier is empty, so in practice the lookup
 is LRU → prefetch → SSD.
 
+### The decode arena
+
+At decode time (T=1) experts don't live in per-expert dicts but in the
+**decode arena**: per-layer preallocated stacked buffers (`[H, ...]` per
+weight tensor, H≈160 slots at default budgets) plus an expert→slot LRU map.
+An expert is copied into a slot **once, on first touch**; from then on the
+k active experts of a layer run as **one `gather_qmm` per projection**,
+addressed by slot index — no per-token stacking, no per-expert kernel
+launches, no dict/lock traffic on the hot path. Slot updates follow the
+KV-cache in-place pattern (scatter with buffer donation) and happen only on
+the decode thread. The dict tiers above still serve prefill and prefetch
+staging; `MOE_NO_ARENA=1` restores the per-expert loop.
+
 The transition table is tiny (40×256×256 float16 ≈ 5 MB) and pays for itself
 immediately: in our tests it roughly doubled throughput.
 
 ---
 
-## Optimization journey (1.8 → ~13 tok/s)
+## Optimization journey (1.8 → ~22 tok/s)
 
 Each step below was measured on the same 448-token benchmark (M4 / 24 GB /
 NVMe) with `tools/bench_breakdown.py`. The lesson that repeats throughout:
@@ -205,13 +222,28 @@ small-kernel overhead from the decode critical path**, not from faster IO.
    load, halving the matmul count on the gate/up side in every dispatch
    path. The Metal wired-memory limit is also set explicitly at startup.
 
+9. **Decode arena** (~10.5 → ~12.4 one-shot, **19-22 tok/s warm chat**).
+   Step 3 ruled out `gather_qmm` at T=1 because stacking the active experts
+   cost more in copies than the batched kernel saved — *per token*. The
+   arena changes when the copy is paid: each expert is copied into a
+   per-layer preallocated slot **once on first touch**, and decode then
+   addresses experts by slot index with a single `gather_qmm` per
+   projection. Beyond the kernel win (~1.45× on the MoE block in isolation),
+   this removes ~320 locked cache lookups and ~3/4 of the per-layer graph
+   nodes from every token. In multi-turn chat the arena stays warm across
+   turns: measured 19.3/20.6/21.9 tok/s on turns 2-4 (220 tokens each),
+   vs 10.5/9.1/7.8 for the per-expert loop on the same machine state —
+   generated text identical. This is the "GPU-side dispatch" the previous
+   plateau note asked for.
+
 **Dead ends, kept for the record:** threads cannot encode Metal work
 concurrently (hence `mx.async_eval` pipelining instead of worker threads);
 `mx.compile` of the expert chain measured *slower* (extra dispatch
 overhead); wider prefetch (32 experts/layer) hurt due to SSD bandwidth
-contention. The remaining plateau is structural — per-layer router readback
-plus attention compute; going past ~15 tok/s would need GPU-side dispatch
-or custom kernels.
+contention; in-kernel software pipelining of the SDPA attention kernel
+measured ~20% *slower* (register pressure beats latency hiding — GPUs hide
+latency by switching simdgroups, not by in-thread ILP). The remaining
+structural costs are the per-layer router readback and attention compute.
 
 ---
 
@@ -296,7 +328,8 @@ margin) is controlled by `--split lru,prefetch,filler`; default
 moe_stream/
   shards.py     expert shard format + safetensors → per-expert .bin converter
                 (merges gate/up into a single gateup matrix at load)
-  cache.py      three-tier cache (LRU / prefetch / filler), strict eviction order
+  cache.py      three-tier cache (LRU / prefetch / filler) + decode arena
+                (per-layer stacked expert slots for gather_qmm at T=1)
   io_pool.py    priority-queue thread pool + background filler loop
   predictor.py  transition-table next-layer expert prediction
   profiler.py   offline activation profiling → transition_table.npy

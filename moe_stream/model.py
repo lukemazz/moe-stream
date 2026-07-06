@@ -4,6 +4,7 @@ predictive prefetch after each router decision (spec sections 3, 6, 8).
 """
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -11,7 +12,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .cache import ExpertCache, LRU, PREFETCH
+from .cache import DecodeArena, ExpertCache, LRU, PREFETCH
 from .io_pool import FillerLoop, IOPool
 from .predictor import Predictor
 
@@ -35,8 +36,27 @@ class StreamedSwitchGLU(nn.Module):
         self.bits = bits
         self.group_size = group_size
 
+    def _expert_slot(self, expert_id: int) -> int:
+        """Decode path: resolve an expert to its arena slot, inserting it on
+        first touch (the one-time copy that per-token stacking would pay
+        every token). The dict-cache entry is dropped after the move so the
+        expert is not held in RAM twice."""
+        ar = self.rt.arena
+        slot = ar.lookup(self.layer_idx, expert_id)
+        if slot is None:
+            arrays = self._expert_arrays(expert_id)
+            slot = ar.insert(self.layer_idx, expert_id, arrays)
+            self.rt.cache.remove((self.layer_idx, expert_id))
+        return slot
+
     def _expert_arrays(self, expert_id: int):
         key = (self.layer_idx, expert_id)
+        ar = self.rt.arena
+        if ar is not None:
+            slot = ar.lookup(self.layer_idx, expert_id)
+            if slot is not None:  # lazy row views, no copy
+                bufs = ar.layers[self.layer_idx]
+                return {name: bufs[name][slot] for name in bufs}
         arrays = self.rt.cache.get(key)
         if arrays is None:
             # if a prefetch for this key is in flight, wait briefly for it
@@ -49,7 +69,17 @@ class StreamedSwitchGLU(nn.Module):
             arrays = self.rt.cache.get(key)
             if arrays is None:
                 self.rt.sync_loads += 1
+                prev = self.rt._last_active.get(self.layer_idx - 1)
+                if self.layer_idx == 0 or prev is None:
+                    self.rt.pred_na += 1
+                elif expert_id in self.rt.predictor.predict(
+                        self.layer_idx - 1, prev, self.rt.prefetch_width):
+                    self.rt.pred_hit += 1
+                else:
+                    self.rt.pred_miss += 1
+                _t = time.monotonic()
                 arrays = self.rt.io.load_sync(key)
+                self.rt.sync_secs += time.monotonic() - _t
                 self.rt.cache.put(key, arrays, tier=LRU)
         return arrays
 
@@ -83,6 +113,7 @@ class StreamedSwitchGLU(nn.Module):
         xt = x.reshape(-1, D)
         idx = np.array(indices.reshape(-1, k))  # forces eval of router output
         T = xt.shape[0]
+        self.rt._last_active[self.layer_idx] = np.unique(idx)  # for pred probe
 
         # enqueue prefetch for the next layers BEFORE computing this layer's
         # experts, so SSD IO overlaps with the GPU work below
@@ -94,6 +125,19 @@ class StreamedSwitchGLU(nn.Module):
         # active experts once and run three batched gather_qmm kernels, where
         # the copy is amortized over all tokens.
         if T == 1:
+            if self.rt.arena is not None:
+                # all k experts as ONE gather_qmm per projection, addressed by
+                # arena slot — no per-token stacking, no per-expert launches
+                slots = [self._expert_slot(int(e)) for e in idx[0]]
+                bufs = self.rt.arena.layers[self.layer_idx]
+                ridx = mx.array([slots], dtype=mx.uint32)
+                xe = xt.reshape(1, 1, 1, D)
+                gu = self._gather_qmm(xe, bufs, "gateup_proj", ridx)
+                h = gu.shape[-1] // 2
+                y = self._gather_qmm(_swiglu(gu[..., :h], gu[..., h:]),
+                                     bufs, "down_proj", ridx)
+                return y.squeeze(-2).reshape(*lead, k, D)
+
             # single token: router experts are distinct, no scatter needed
             ys = []
             for e in idx[0]:
@@ -169,6 +213,14 @@ class StreamRuntime:
         self.n_layers = n_layers
         self.n_experts = n_experts
         self.sync_loads = 0
+        # sync-load predictability probe: was a synchronously-loaded expert one
+        # the transition-table predictor would have named from the prev layer's
+        # active set? pred_hit = predictable (timing/eviction gap); pred_miss =
+        # predictor didn't know it; pred_na = layer 0, no prev MoE layer.
+        self.pred_hit = self.pred_miss = self.pred_na = 0
+        self.sync_secs = 0.0  # wall time blocked on synchronous SSD reads
+        self._last_active = {}  # moe layer_idx -> active expert ids this step
+        self.arena = None  # DecodeArena, set by load_streamed_model
         self.recorder = None  # set by profiler: fn(layer, np_indices)
         self.gates = None  # routers of all layers, set by load_streamed_model
         self.use_lookahead = True
@@ -204,6 +256,8 @@ class StreamRuntime:
         for nxt, d, preds_arr in self._la_pending:
             prio = 10.0 / d
             for rank, e in enumerate(np.array(preds_arr).tolist()):
+                if self.arena is not None and self.arena.contains(nxt, e):
+                    continue  # already resident in the decode arena
                 self.io.enqueue((nxt, e), priority=prio - 0.01 * rank,
                                 tier=PREFETCH)
         self._la_pending.clear()
@@ -233,13 +287,21 @@ class StreamRuntime:
                 break
             prio = 10.0 / d
             for rank, e in enumerate(preds):
+                if self.arena is not None and self.arena.contains(layer + d, e):
+                    continue
                 self.io.enqueue((layer + d, e), priority=prio - 0.01 * rank,
                                 tier=PREFETCH)
             active = preds
 
     def stats(self):
         s = self.cache.stats()
+        if self.arena is not None:
+            s.update(self.arena.stats())
         s["sync_loads"] = self.sync_loads
+        s["sync_predictable"] = self.pred_hit
+        s["sync_unpredictable"] = self.pred_miss
+        s["sync_layer0"] = self.pred_na
+        s["sync_secs"] = round(self.sync_secs, 2)
         return s
 
     def stop(self):
@@ -264,10 +326,17 @@ def load_streamed_model(model_dir: Path, shard_dir: Path, *,
 
     model, _ = load_model(model_dir, lazy=True)
 
+    # The decode arena takes most of the LRU budget: the dict cache then only
+    # stages prefetch/prefill entries on their way in. MOE_NO_ARENA=1 restores
+    # the per-expert loop with the full budget on the dict LRU (for A/B).
+    arena_bytes = 0 if os.environ.get("MOE_NO_ARENA") else int(lru_bytes * 0.85)
+
     rt = StreamRuntime(Path(shard_dir), n_layers, n_experts,
-                       lru_bytes, prefetch_bytes, filler_bytes,
+                       lru_bytes - arena_bytes, prefetch_bytes, filler_bytes,
                        table_path=table_path, prefetch_depth=prefetch_depth,
                        prefetch_width=prefetch_width, io_threads=io_threads)
+    if arena_bytes:
+        rt.arena = DecodeArena(n_layers, arena_bytes)
 
     inner = model.language_model.model if hasattr(model, "language_model") else model.model
     n_swapped = 0
