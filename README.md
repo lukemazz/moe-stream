@@ -340,8 +340,9 @@ edit the variables at the top to match your machine.
 | `--prefetch-depth` | 3 | how many layers ahead to predict |
 | `--prefetch-width` | 16 | experts prefetched per predicted layer |
 | `--io-threads` | 8 | SSD reader threads |
-| `--self-spec` | 0 (off) | self-speculative decoding: draft tokens per cycle — **3 recommended** |
+| `--self-spec` | 0 (off) | self-speculative decoding: draft tokens per cycle — **3 recommended** (2 with `--mtp`) |
 | `--draft-n` | 8 | arena-resident experts used by the draft |
+| `--mtp` | off | use Qwen3.6's native MTP head as the drafter (fetch it once with `python3 tools/fetch_mtp.py mtp_head.safetensors`, ~1.7 GB). Slightly faster one-shot, higher chat peaks, +1.7 GB RAM; the expert draft is steadier |
 
 RAM budget split (after subtracting OS, fixed weights, KV cache, safety
 margin) is controlled by `--split lru,prefetch,filler`; default
@@ -362,6 +363,7 @@ moe_stream/
   generate.py   one-shot generation CLI with stats
   chat.py       interactive multi-turn chat (persistent KV cache)
   self_spec.py  expert-subsampled self-speculative decoding (--self-spec)
+  mtp.py        Qwen3.6's native MTP head as an alternative drafter (--mtp)
 tools/
   bench_breakdown.py  per-stage decode benchmark used for the measurements
 run.sh, chat.sh launchers

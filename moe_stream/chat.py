@@ -38,6 +38,9 @@ def main():
                    help="auto-speculativa: K token di bozza per ciclo (0=off)")
     p.add_argument("--draft-n", type=int, default=8,
                    help="esperti residenti usati dalla bozza")
+    p.add_argument("--mtp", type=Path, default=None, metavar="SAFETENSORS",
+                   help="testa MTP nativa come drafter (es. mtp_head."
+                        "safetensors); richiede --self-spec")
     args = p.parse_args()
     max_toks = args.max_tokens if args.max_tokens > 0 else (1 << 30)
 
@@ -55,6 +58,12 @@ def main():
           f"(Ctrl+C ferma la generazione)\n")
 
     prompt_cache = make_prompt_cache(model)
+    mtp_head = mtp_cache = None
+    if args.mtp:
+        from .mtp import load_mtp_head, make_mtp_cache
+        mtp_head = load_mtp_head(args.mtp, model.language_model)
+        mx.eval(mtp_head.parameters())
+        mtp_cache = make_mtp_cache(model)
     thinking = True  # effort: high = thinking abilitato, low = disabilitato
 
     while True:
@@ -88,6 +97,9 @@ def main():
             continue
         if user == "/reset":
             prompt_cache = make_prompt_cache(model)
+            if args.mtp:
+                from .mtp import make_mtp_cache
+                mtp_cache = make_mtp_cache(model)
             print("(conversazione azzerata)")
             continue
 
@@ -102,14 +114,21 @@ def main():
         print("ai> ", end="", flush=True)
         try:
             if args.self_spec:
-                from .self_spec import self_spec_generate
+                from .self_spec import mtp_spec_generate, self_spec_generate
                 detok = tokenizer.detokenizer
                 detok.reset()
-                for tok in self_spec_generate(
+                if mtp_head is not None:
+                    gen = mtp_spec_generate(
+                        model, rt, mtp_head, new_tokens, cache=prompt_cache,
+                        mtp_cache=mtp_cache, max_tokens=max_toks,
+                        k=args.self_spec, eos=set(tokenizer.eos_token_ids))
+                else:
+                    gen = self_spec_generate(
                         model, rt, new_tokens, cache=prompt_cache,
                         max_tokens=max_toks, k=args.self_spec,
                         draft_n=args.draft_n,
-                        eos=set(tokenizer.eos_token_ids)):
+                        eos=set(tokenizer.eos_token_ids))
+                for tok in gen:
                     detok.add_token(tok)
                     print(detok.last_segment, end="", flush=True)
                     n_tok += 1

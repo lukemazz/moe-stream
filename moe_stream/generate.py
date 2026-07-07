@@ -45,6 +45,9 @@ def main():
                    help="auto-speculativa: K token di bozza per ciclo (0=off)")
     p.add_argument("--draft-n", type=int, default=8,
                    help="esperti residenti usati dalla bozza")
+    p.add_argument("--mtp", type=Path, default=None, metavar="SAFETENSORS",
+                   help="testa MTP nativa come drafter (es. mtp_head."
+                        "safetensors); richiede --self-spec")
     args = p.parse_args()
 
     fracs = tuple(float(x) for x in args.split.split(","))
@@ -75,14 +78,24 @@ def main():
     t0 = time.time()
     resp = None
     if args.self_spec:
-        from .self_spec import self_spec_generate
+        from .self_spec import mtp_spec_generate, self_spec_generate
         prompt_ids = tokenizer.encode(text)
         detok = tokenizer.detokenizer
         detok.reset()
-        for tok in self_spec_generate(model, rt, prompt_ids,
-                                      max_tokens=args.max_tokens,
-                                      k=args.self_spec, draft_n=args.draft_n,
-                                      eos=set(tokenizer.eos_token_ids)):
+        if args.mtp:
+            from .mtp import load_mtp_head
+            head = load_mtp_head(args.mtp, model.language_model)
+            mx.eval(head.parameters())
+            gen = mtp_spec_generate(model, rt, head, prompt_ids,
+                                    max_tokens=args.max_tokens,
+                                    k=args.self_spec,
+                                    eos=set(tokenizer.eos_token_ids))
+        else:
+            gen = self_spec_generate(model, rt, prompt_ids,
+                                     max_tokens=args.max_tokens,
+                                     k=args.self_spec, draft_n=args.draft_n,
+                                     eos=set(tokenizer.eos_token_ids))
+        for tok in gen:
             detok.add_token(tok)
             print(detok.last_segment, end="", flush=True)
             n_tok += 1
