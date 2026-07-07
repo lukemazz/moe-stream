@@ -340,7 +340,7 @@ edit the variables at the top to match your machine.
 | `--prefetch-depth` | 3 | how many layers ahead to predict |
 | `--prefetch-width` | 16 | experts prefetched per predicted layer |
 | `--io-threads` | 8 | SSD reader threads |
-| `--self-spec` | 0 (off) | self-speculative decoding: draft tokens per cycle — **3 recommended** (2 with `--mtp`) |
+| `--self-spec` | **3 (on by default)** | self-speculative decoding: draft tokens per cycle (0 = off; use 2 with `--mtp`) |
 | `--draft-n` | 8 | arena-resident experts used by the draft |
 | `--mtp` | off | use Qwen3.6's native MTP head as the drafter (fetch it once with `python3 tools/fetch_mtp.py mtp_head.safetensors`, ~1.7 GB). Slightly faster one-shot, higher chat peaks, +1.7 GB RAM; the expert draft is steadier |
 

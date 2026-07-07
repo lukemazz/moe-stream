@@ -41,8 +41,8 @@ def main():
     p.add_argument("--io-threads", type=int, default=8)
     p.add_argument("--split", default="0.87,0.13,0.0",
                    help="RAM fractions for lru,prefetch,filler")
-    p.add_argument("--self-spec", type=int, default=0, metavar="K",
-                   help="auto-speculativa: K token di bozza per ciclo (0=off)")
+    p.add_argument("--self-spec", type=int, default=3, metavar="K",
+                   help="auto-speculativa: K token di bozza per ciclo (default 3; 0=off)")
     p.add_argument("--draft-n", type=int, default=8,
                    help="esperti residenti usati dalla bozza")
     p.add_argument("--mtp", type=Path, default=None, metavar="SAFETENSORS",
