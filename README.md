@@ -24,6 +24,10 @@ Measured on M4 / 24 GB / NVMe:
   + merged gate/up projections          12.8 tok/s cold / ~13 tok/s warm
   + decode arena (gather_qmm at T=1)    ~12.4 tok/s one-shot,
                                         19-22 tok/s warm multi-turn chat
+  + self-speculative decoding           ~16 tok/s one-shot,
+    (--self-spec 3, default draft-n 8)  22-23 tok/s warm chat — and nearly
+                                        flat under CPU load (the plain path
+                                        swings 9-25 on a busy machine)
 ```
 
 ---
@@ -168,7 +172,7 @@ immediately: in our tests it roughly doubled throughput.
 
 ---
 
-## Optimization journey (1.8 → ~22 tok/s)
+## Optimization journey (1.8 → ~23 tok/s)
 
 Each step below was measured on the same 448-token benchmark (M4 / 24 GB /
 NVMe) with `tools/bench_breakdown.py`. The lesson that repeats throughout:
@@ -235,6 +239,25 @@ small-kernel overhead from the decode critical path**, not from faster IO.
    vs 10.5/9.1/7.8 for the per-expert loop on the same machine state —
    generated text identical. This is the "GPU-side dispatch" the previous
    plateau note asked for.
+
+10. **Expert-subsampled self-speculative decoding** (warm chat 18 → **22-23
+    tok/s**; one-shot ~12.4 → ~16). The model drafts ahead as its own cheap
+    approximation: a draft forward uses up to 8 experts chosen **only among
+    arena-resident ones**, selected on the GPU via per-layer expert→slot
+    tables — zero router readback, zero SSD, zero Python on the draft path.
+    A full-path verify then checks k drafted tokens in ONE forward,
+    amortizing the 40 per-layer router readbacks across k tokens. Single
+    prompt cache with snapshot/rollback (the recurrent DeltaNet state is
+    rebuilt functionally each step, so snapshots are free reference copies).
+    Acceptance measures ~90%: drafting experts is nearly free (attention
+    dominates draft cost), so use MORE experts in the draft, not fewer —
+    and k=3 keeps verification (T=4, 4×8=32) on the fused attention kernel.
+    One-shot output is token-identical to normal greedy decode; in chat it
+    is deterministic but may differ on numerical near-ties (q_len>1 kernels
+    round differently). Biggest practical win: the spec path makes ~2 CPU
+    syncs per 3-token cycle instead of 40 per token, so it holds 18-22 tok/s
+    on a busy machine where the plain path swings between 9 and 25.
+    Enable with `--self-spec 3` (chat.py and generate.py).
 
 **Dead ends, kept for the record:** threads cannot encode Metal work
 concurrently (hence `mx.async_eval` pipelining instead of worker threads);
@@ -317,6 +340,8 @@ edit the variables at the top to match your machine.
 | `--prefetch-depth` | 3 | how many layers ahead to predict |
 | `--prefetch-width` | 16 | experts prefetched per predicted layer |
 | `--io-threads` | 8 | SSD reader threads |
+| `--self-spec` | 0 (off) | self-speculative decoding: draft tokens per cycle — **3 recommended** |
+| `--draft-n` | 8 | arena-resident experts used by the draft |
 
 RAM budget split (after subtracting OS, fixed weights, KV cache, safety
 margin) is controlled by `--split lru,prefetch,filler`; default
@@ -336,6 +361,7 @@ moe_stream/
   model.py      MLX wrapper: swaps each MoE SwitchGLU for a streamed version
   generate.py   one-shot generation CLI with stats
   chat.py       interactive multi-turn chat (persistent KV cache)
+  self_spec.py  expert-subsampled self-speculative decoding (--self-spec)
 tools/
   bench_breakdown.py  per-stage decode benchmark used for the measurements
 run.sh, chat.sh launchers
