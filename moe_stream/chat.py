@@ -23,7 +23,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("model_dir", type=Path)
     p.add_argument("shard_dir", type=Path)
-    p.add_argument("-n", "--max-tokens", type=int, default=4096)
+    p.add_argument("-n", "--max-tokens", type=int, default=-1,
+                   help="massimo token per risposta (-1 = illimitato: si "
+                        "ferma all'EOS; Ctrl+C interrompe comunque)")
     p.add_argument("--ram-gb", type=float, default=24.0)
     p.add_argument("--context-k", type=int, default=8)
     p.add_argument("--table", type=Path, default=None)
@@ -37,6 +39,7 @@ def main():
     p.add_argument("--draft-n", type=int, default=8,
                    help="esperti residenti usati dalla bozza")
     args = p.parse_args()
+    max_toks = args.max_tokens if args.max_tokens > 0 else (1 << 30)
 
     fracs = tuple(float(x) for x in args.split.split(","))
     lru_b, pre_b, fill_b = budget_split(args.ram_gb, args.context_k, fracs)
@@ -104,7 +107,7 @@ def main():
                 detok.reset()
                 for tok in self_spec_generate(
                         model, rt, new_tokens, cache=prompt_cache,
-                        max_tokens=args.max_tokens, k=args.self_spec,
+                        max_tokens=max_toks, k=args.self_spec,
                         draft_n=args.draft_n,
                         eos=set(tokenizer.eos_token_ids)):
                     detok.add_token(tok)
@@ -114,7 +117,7 @@ def main():
                 print(detok.last_segment, end="", flush=True)
             else:
                 for resp in stream_generate(model, tokenizer, new_tokens,
-                                            max_tokens=args.max_tokens,
+                                            max_tokens=max_toks,
                                             prompt_cache=prompt_cache):
                     print(resp.text, end="", flush=True)
                     n_tok += 1
