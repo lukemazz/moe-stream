@@ -28,6 +28,10 @@ Measured on M4 / 24 GB / NVMe:
     (--self-spec 3, default draft-n 8)  22-23 tok/s warm chat — and nearly
                                         flat under CPU load (the plain path
                                         swings 9-25 on a busy machine)
+  + lockstep batch mode (--batch)       ~104 tok/s aggregate at 32 parallel
+                                        prompts (~115 at 64) — batched rows
+                                        share expert reads and the batched
+                                        lookahead vote-prioritizes prefetch
 ```
 
 ---
@@ -342,6 +346,9 @@ edit the variables at the top to match your machine.
 | `--io-threads` | 8 | SSD reader threads |
 | `--self-spec` | **3 (on by default)** | self-speculative decoding: draft tokens per cycle (0 = off; use 2 with `--mtp`) |
 | `--draft-n` | 8 | arena-resident experts used by the draft |
+| `--batch FILE` | off | bulk mode: one prompt per line, generated in lockstep waves (**~104 tok/s aggregate at wave 32**, ~115 at 64); disables --self-spec |
+| `--batch-size` | 32 | wave width — 32 is the measured sweet spot (103.7 tok/s aggregate, 3.2 tok/s per prompt); 64 works (~115) but starts touching swap |
+| `--ram-gb` | auto | budget sizing; 0 = detect physical RAM (don't oversize: measured counterproductive, pushes macOS into swap) |
 | `--mtp` | off | use Qwen3.6's native MTP head as the drafter (fetch it once with `python3 tools/fetch_mtp.py mtp_head.safetensors`, ~1.7 GB). Slightly faster one-shot, higher chat peaks, +1.7 GB RAM; the expert draft is steadier |
 
 RAM budget split (after subtracting OS, fixed weights, KV cache, safety

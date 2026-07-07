@@ -422,7 +422,9 @@ def load_streamed_model(model_dir: Path, shard_dir: Path, *,
     # The decode arena takes most of the LRU budget: the dict cache then only
     # stages prefetch/prefill entries on their way in. MOE_NO_ARENA=1 restores
     # the per-expert loop with the full budget on the dict LRU (for A/B).
-    arena_bytes = 0 if os.environ.get("MOE_NO_ARENA") else int(lru_bytes * 0.85)
+    arena_frac = 0.0 if os.environ.get("MOE_NO_ARENA") else float(
+        os.environ.get("MOE_ARENA_FRAC", "0.85"))
+    arena_bytes = int(lru_bytes * arena_frac)
 
     rt = StreamRuntime(Path(shard_dir), n_layers, n_experts,
                        lru_bytes - arena_bytes, prefetch_bytes, filler_bytes,

@@ -13,7 +13,7 @@ import mlx.core as mx
 
 
 def budget_split(total_ram_gb: float, context_k: int,
-                 fractions=(0.27, 0.09, 0.64)):
+                 fractions=(0.87, 0.13, 0.0)):
     """Spec section 9 memory budget calculator. fractions = (lru, prefetch, filler)."""
     avail = total_ram_gb - 4 - 4 - 0.125 * context_k - 1
     avail = max(avail, 1.0)
@@ -32,7 +32,8 @@ def main():
     p.add_argument("shard_dir", type=Path)
     p.add_argument("-p", "--prompt", default="What is 2+2?")
     p.add_argument("-n", "--max-tokens", type=int, default=128)
-    p.add_argument("--ram-gb", type=float, default=24.0)
+    p.add_argument("--ram-gb", type=float, default=0,
+                   help="RAM totale per i budget (0 = auto dalla RAM fisica)")
     p.add_argument("--context-k", type=int, default=4)
     p.add_argument("--table", type=Path, default=None,
                    help="transition_table.npy from the profiler")
@@ -48,12 +49,23 @@ def main():
     p.add_argument("--mtp", type=Path, default=None, metavar="SAFETENSORS",
                    help="testa MTP nativa come drafter (es. mtp_head."
                         "safetensors); richiede --self-spec")
+    p.add_argument("--batch", type=Path, default=None, metavar="FILE",
+                   help="modalità batch: un prompt per riga, generati in "
+                        "lockstep a wave da --batch-size (~100 tok/s "
+                        "aggregati a wave 32; disattiva --self-spec)")
+    p.add_argument("--batch-size", type=int, default=32,
+                   help="ampiezza della wave (32 = sweet spot misurato: "
+                        "~104 tok/s aggregati, ~3 tok/s per prompt)")
     args = p.parse_args()
 
+    if not args.ram_gb:
+        import os as _os
+        args.ram_gb = (_os.sysconf("SC_PAGE_SIZE")
+                       * _os.sysconf("SC_PHYS_PAGES")) / 1e9
     fracs = tuple(float(x) for x in args.split.split(","))
     lru_b, pre_b, fill_b = budget_split(args.ram_gb, args.context_k, fracs)
     print(f"budgets: LRU={lru_b/1e9:.1f}GB prefetch={pre_b/1e9:.1f}GB "
-          f"filler={fill_b/1e9:.1f}GB")
+          f"filler={fill_b/1e9:.1f}GB (ram={args.ram_gb:.0f}GB)")
 
     try:
         mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
@@ -69,6 +81,31 @@ def main():
     tokenizer = load_tokenizer(args.model_dir)
     print(f"fixed parts loaded in {time.time()-t0:.1f}s "
           f"(RAM: {mx.get_active_memory()/1e9:.2f} GB)")
+
+    if args.batch:
+        from mlx_lm.generate import batch_generate
+        prompts = [ln.strip() for ln in args.batch.read_text().splitlines()
+                   if ln.strip()]
+        print(f"[batch] {len(prompts)} prompt, wave da {args.batch_size}")
+        t0 = time.time()
+        n_tok = 0
+        for w0 in range(0, len(prompts), args.batch_size):
+            wave = prompts[w0:w0 + args.batch_size]
+            ids = [tokenizer.apply_chat_template(
+                       [{"role": "user", "content": p}],
+                       add_generation_prompt=True) for p in wave]
+            res = batch_generate(model, tokenizer, prompts=ids,
+                                 max_tokens=args.max_tokens, verbose=False)
+            for p, out in zip(wave, res.texts):
+                n_tok += len(tokenizer.encode(out))
+                print(f"\n===== PROMPT: {p}\n{out}")
+        dt = time.time() - t0
+        print(f"\n--- [batch] {n_tok} token in {dt:.1f}s = "
+              f"{n_tok/dt:.2f} tok/s aggregati")
+        print(json.dumps(rt.stats(), indent=2))
+        print(f"peak RAM: {mx.get_peak_memory()/1e9:.2f} GB")
+        rt.stop()
+        return
 
     msgs = [{"role": "user", "content": args.prompt}]
     text = tokenizer.apply_chat_template(msgs, add_generation_prompt=True,
