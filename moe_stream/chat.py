@@ -23,7 +23,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("model_dir", type=Path)
     p.add_argument("shard_dir", type=Path)
-    p.add_argument("-n", "--max-tokens", type=int, default=1024)
+    p.add_argument("-n", "--max-tokens", type=int, default=4096)
     p.add_argument("--ram-gb", type=float, default=24.0)
     p.add_argument("--context-k", type=int, default=8)
     p.add_argument("--table", type=Path, default=None)
@@ -32,6 +32,10 @@ def main():
     p.add_argument("--io-threads", type=int, default=8)
     p.add_argument("--split", default="0.87,0.13,0.0",
                    help="RAM fractions for lru,prefetch,filler")
+    p.add_argument("--self-spec", type=int, default=0, metavar="K",
+                   help="auto-speculativa: K token di bozza per ciclo (0=off)")
+    p.add_argument("--draft-n", type=int, default=8,
+                   help="esperti residenti usati dalla bozza")
     args = p.parse_args()
 
     fracs = tuple(float(x) for x in args.split.split(","))
@@ -94,11 +98,26 @@ def main():
         t0 = time.time()
         print("ai> ", end="", flush=True)
         try:
-            for resp in stream_generate(model, tokenizer, new_tokens,
-                                        max_tokens=args.max_tokens,
-                                        prompt_cache=prompt_cache):
-                print(resp.text, end="", flush=True)
-                n_tok += 1
+            if args.self_spec:
+                from .self_spec import self_spec_generate
+                detok = tokenizer.detokenizer
+                detok.reset()
+                for tok in self_spec_generate(
+                        model, rt, new_tokens, cache=prompt_cache,
+                        max_tokens=args.max_tokens, k=args.self_spec,
+                        draft_n=args.draft_n,
+                        eos=set(tokenizer.eos_token_ids)):
+                    detok.add_token(tok)
+                    print(detok.last_segment, end="", flush=True)
+                    n_tok += 1
+                detok.finalize()
+                print(detok.last_segment, end="", flush=True)
+            else:
+                for resp in stream_generate(model, tokenizer, new_tokens,
+                                            max_tokens=args.max_tokens,
+                                            prompt_cache=prompt_cache):
+                    print(resp.text, end="", flush=True)
+                    n_tok += 1
         except KeyboardInterrupt:
             print("\n   [generazione interrotta]", end="")
         dt = time.time() - t0

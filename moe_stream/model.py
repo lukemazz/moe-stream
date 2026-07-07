@@ -106,11 +106,43 @@ class StreamedSwitchGLU(nn.Module):
             bits=self.bits,
         )
 
+    def _draft_gpu(self, xt, indices, lead, k, D):
+        """Forward bozza SENZA readback: fino a draft_n esperti tra i residenti
+        in arena, scelti per punteggio del router interamente su GPU tramite la
+        slot-table. Può essere 'sbagliato' (esperti assenti -> contributo zero,
+        layer mai inseriti -> solo shared expert): è la bozza — la correttezza
+        la garantisce il forward di verifica sul percorso pieno."""
+        ar = self.rt.arena
+        st = ar.slot_tables[self.layer_idx] if ar is not None else None
+        if st is None:  # layer senza arena (es. 0-2 anti-thrash)
+            return mx.zeros((*lead, k, D), dtype=xt.dtype)
+        bufs = ar.layers[self.layer_idx]
+        n = min(self.rt.draft_n, k)
+        idxf = indices.reshape(-1)                  # [k]
+        slots = st[idxf]                            # [k], -1 = assente
+        g = self.rt.gates[self.layer_idx](xt)[0]    # [n_experts] logits
+        s = mx.where(slots >= 0, g[idxf].astype(mx.float32),
+                     mx.full((k,), -1e30))
+        keep = mx.argsort(-s)[:n]                   # posizioni dei migliori n
+        sel = slots[keep]                           # [n] slot scelti (o -1)
+        ridx = mx.maximum(sel, 0).astype(mx.uint32).reshape(1, n)
+        xe = xt.reshape(1, 1, 1, D)
+        gu = self._gather_qmm(xe, bufs, "gateup_proj", ridx)
+        h = gu.shape[-1] // 2
+        y = self._gather_qmm(_swiglu(gu[..., :h], gu[..., h:]),
+                             bufs, "down_proj", ridx).squeeze(-2)  # [1, n, D]
+        y = y * (sel >= 0).astype(y.dtype).reshape(1, n, 1)
+        onehot = (mx.arange(k).reshape(k, 1) == keep.reshape(1, n))
+        out = onehot.astype(y.dtype) @ y[0]         # [k, D] nei loro slot
+        return out.reshape(*lead, k, D)
+
     def __call__(self, x, indices) -> mx.array:
         # x: [..., D], indices: [..., k]
         *lead, D = x.shape
         k = indices.shape[-1]
         xt = x.reshape(-1, D)
+        if self.rt.draft_gpu and xt.shape[0] == 1:
+            return self._draft_gpu(xt, indices, lead, k, D)
         idx = np.array(indices.reshape(-1, k))  # forces eval of router output
         T = xt.shape[0]
         self.rt._last_active[self.layer_idx] = np.unique(idx)  # for pred probe
@@ -124,20 +156,54 @@ class StreamedSwitchGLU(nn.Module):
         # than it saves in kernel launches. Prefill (many tokens): stack the
         # active experts once and run three batched gather_qmm kernels, where
         # the copy is amortized over all tokens.
-        if T == 1:
-            if self.rt.arena is not None:
-                # all k experts as ONE gather_qmm per projection, addressed by
-                # arena slot — no per-token stacking, no per-expert launches
-                slots = [self._expert_slot(int(e)) for e in idx[0]]
-                bufs = self.rt.arena.layers[self.layer_idx]
-                ridx = mx.array([slots], dtype=mx.uint32)
-                xe = xt.reshape(1, 1, 1, D)
+        if T == 1 and self.rt.draft_top1:
+            # DRAFT auto-speculativa: solo il miglior esperto (preferendo i
+            # residenti in arena), col suo peso vero — l'output va nel suo
+            # slot e gli altri restano zero, così il caller ricostruisce
+            # esattamente w1*y1 + shared_expert. Correttezza NON richiesta:
+            # è la bozza; il forward di verifica usa il percorso pieno.
+            ar = self.rt.arena
+            sc = np.array(
+                self.rt.gates[self.layer_idx](xt).astype(mx.float32))[0]
+            cand = [int(e) for e in idx[0]]
+            pool = [e for e in cand
+                    if ar is not None and ar.contains(self.layer_idx, e)] or cand
+            chosen = set(sorted(pool, key=lambda q: sc[q],
+                                reverse=True)[:self.rt.draft_n])
+            outs = {}
+            for e in chosen:
+                arrays = self._expert_arrays(e)
+                gu = self._qmm(xt, arrays, "gateup_proj")
+                h = gu.shape[-1] // 2
+                outs[e] = self._qmm(_swiglu(gu[..., :h], gu[..., h:]),
+                                    arrays, "down_proj")
+            z = mx.zeros_like(next(iter(outs.values())))
+            ys = [outs.get(c, z) for c in cand]
+            return mx.stack(ys, axis=1).reshape(*lead, k, D)
+
+        if (self.rt.arena is not None
+                and self.layer_idx not in self.rt.arena_skip
+                and T * k <= 4096):
+            # decode E verifica speculativa (T piccolo): gli esperti attivi come
+            # UN gather_qmm per proiezione, indirizzati per slot di arena.
+            # Guardia LRU: tutti gli esperti unici devono poter risiedere
+            # simultaneamente negli slot senza sfrattarsi a vicenda.
+            uniq, inv = np.unique(idx, return_inverse=True)
+            ar = self.rt.arena
+            if ar.h == 0:
+                self._expert_slot(int(uniq[0]))  # dimensiona l'arena (bootstrap)
+            if T == 1 or len(uniq) <= ar.h // 2:
+                slots = np.array([self._expert_slot(int(e)) for e in uniq])
+                ridx = mx.array(slots[inv].reshape(T, k).astype(np.uint32))
+                bufs = ar.layers[self.layer_idx]
+                xe = xt.reshape(T, 1, 1, D)
                 gu = self._gather_qmm(xe, bufs, "gateup_proj", ridx)
                 h = gu.shape[-1] // 2
                 y = self._gather_qmm(_swiglu(gu[..., :h], gu[..., h:]),
                                      bufs, "down_proj", ridx)
                 return y.squeeze(-2).reshape(*lead, k, D)
 
+        if T == 1:
             # single token: router experts are distinct, no scatter needed
             ys = []
             for e in idx[0]:
@@ -191,6 +257,18 @@ class _EmbedHook(nn.Module):
     def __call__(self, x):
         y = self.embed(x)
         if y.size // y.shape[-1] <= 8:  # decode only; prefill warms itself
+            rt = self.rt
+            if rt.draft_gpu:
+                return y  # bozza: niente lookahead/probe, zero Python
+            if rt.arena is not None:
+                # PROBE temporaneo (design no-readback): un token che ha
+                # causato >=1 insert in arena sarebbe stato un token-miss
+                # (da ricalcolare) nel decode ottimistico.
+                ins = rt.arena.inserts
+                if rt._probe_last_ins is not None and ins > rt._probe_last_ins:
+                    rt.miss_tokens += 1
+                rt._probe_last_ins = ins
+                rt.decode_tokens += 1
             self.rt.lookahead_from(-1, y.reshape(-1, y.shape[-1]))
         return y
 
@@ -221,6 +299,19 @@ class StreamRuntime:
         self.sync_secs = 0.0  # wall time blocked on synchronous SSD reads
         self._last_active = {}  # moe layer_idx -> active expert ids this step
         self.arena = None  # DecodeArena, set by load_streamed_model
+        # anti-thrash: layer il cui working set eccede gli slot (misurato:
+        # 0-2 fanno churn oltre il ritmo dei token) girano sul percorso dict,
+        # risparmiando insert-copy inutili (+10-12% misurato sui turni caldi).
+        # Override con MOE_ARENA_SKIP (es. "" per disattivare, "0,1,2,3" ...).
+        self.arena_skip = frozenset(
+            int(x) for x in os.environ.get("MOE_ARENA_SKIP", "0,1,2").split(",")
+            if x.strip())
+        self.draft_top1 = False  # bozza CPU (solo per acceptance_bench)
+        self.draft_gpu = False  # bozza GPU no-readback (loop auto-speculativo)
+        self.draft_n = int(os.environ.get("MOE_DRAFT_N", "1"))
+        self.miss_tokens = 0  # probe: token con insert arena (no-readback)
+        self.decode_tokens = 0
+        self._probe_last_ins = None
         self.recorder = None  # set by profiler: fn(layer, np_indices)
         self.gates = None  # routers of all layers, set by load_streamed_model
         self.use_lookahead = True
@@ -297,6 +388,8 @@ class StreamRuntime:
         s = self.cache.stats()
         if self.arena is not None:
             s.update(self.arena.stats())
+            s["miss_tokens"] = self.miss_tokens
+            s["decode_tokens"] = self.decode_tokens
         s["sync_loads"] = self.sync_loads
         s["sync_predictable"] = self.pred_hit
         s["sync_unpredictable"] = self.pred_miss
@@ -336,7 +429,7 @@ def load_streamed_model(model_dir: Path, shard_dir: Path, *,
                        table_path=table_path, prefetch_depth=prefetch_depth,
                        prefetch_width=prefetch_width, io_threads=io_threads)
     if arena_bytes:
-        rt.arena = DecodeArena(n_layers, arena_bytes)
+        rt.arena = DecodeArena(n_layers, arena_bytes, n_experts)
 
     inner = model.language_model.model if hasattr(model, "language_model") else model.model
     n_swapped = 0

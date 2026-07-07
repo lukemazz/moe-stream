@@ -28,14 +28,19 @@ class DecodeArena:
     buffer donation), so steady-state inserts do not copy the whole buffer.
     """
 
-    def __init__(self, n_layers: int, total_bytes: int):
+    def __init__(self, n_layers: int, total_bytes: int, n_experts: int = 0):
         self.n_layers = n_layers
         self.total_bytes = total_bytes
+        self.n_experts = n_experts
         self.h = 0  # slots per layer, sized on first insert from expert nbytes
         self.layers = [None] * n_layers  # layer -> {name: stacked buffer}
         self.maps = [OrderedDict() for _ in range(n_layers)]  # expert -> slot
+        # specchio GPU della mappa esperto->slot (-1 = assente), per la bozza
+        # auto-speculativa che seleziona gli esperti senza readback CPU
+        self.slot_tables = [None] * n_layers
         self.hits = 0
         self.inserts = 0
+        self.layer_inserts = [0] * n_layers  # probe: churn per layer
 
     def lookup(self, layer: int, expert: int):
         m = self.maps[layer]
@@ -61,17 +66,28 @@ class DecodeArena:
         m = self.maps[layer]
         if len(m) < self.h:
             slot = len(m)
+            evicted = None
         else:
-            _, slot = m.popitem(last=False)  # reuse the LRU slot
+            evicted, slot = m.popitem(last=False)  # reuse the LRU slot
         for name, a in arrays.items():
             bufs[name][slot] = a
         m[expert] = slot
+        if self.n_experts:
+            st = self.slot_tables[layer]
+            if st is None:
+                st = mx.full((self.n_experts,), -1, dtype=mx.int32)
+                self.slot_tables[layer] = st
+            if evicted is not None:
+                st[evicted] = -1
+            st[expert] = slot
         self.inserts += 1
+        self.layer_inserts[layer] += 1
         return slot
 
     def stats(self) -> dict:
         return {"arena_hits": self.hits, "arena_inserts": self.inserts,
-                "arena_slots_per_layer": self.h}
+                "arena_slots_per_layer": self.h,
+                "arena_layer_inserts": list(self.layer_inserts)}
 
 
 class ExpertCache:

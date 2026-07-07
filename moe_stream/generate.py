@@ -41,6 +41,10 @@ def main():
     p.add_argument("--io-threads", type=int, default=8)
     p.add_argument("--split", default="0.87,0.13,0.0",
                    help="RAM fractions for lru,prefetch,filler")
+    p.add_argument("--self-spec", type=int, default=0, metavar="K",
+                   help="auto-speculativa: K token di bozza per ciclo (0=off)")
+    p.add_argument("--draft-n", type=int, default=8,
+                   help="esperti residenti usati dalla bozza")
     args = p.parse_args()
 
     fracs = tuple(float(x) for x in args.split.split(","))
@@ -70,11 +74,32 @@ def main():
     n_tok = 0
     t0 = time.time()
     resp = None
-    for resp in stream_generate(model, tokenizer, text, max_tokens=args.max_tokens):
-        print(resp.text, end="", flush=True)
-        n_tok += 1
-    dt = time.time() - t0
-    print(f"\n\n--- {n_tok} tokens in {dt:.1f}s = {n_tok/dt:.2f} tok/s")
+    if args.self_spec:
+        from .self_spec import self_spec_generate
+        prompt_ids = tokenizer.encode(text)
+        detok = tokenizer.detokenizer
+        detok.reset()
+        for tok in self_spec_generate(model, rt, prompt_ids,
+                                      max_tokens=args.max_tokens,
+                                      k=args.self_spec, draft_n=args.draft_n,
+                                      eos=set(tokenizer.eos_token_ids)):
+            detok.add_token(tok)
+            print(detok.last_segment, end="", flush=True)
+            n_tok += 1
+        detok.finalize()
+        print(detok.last_segment, end="", flush=True)
+        dt = time.time() - t0
+        s = rt.spec_stats
+        print(f"\n\n--- {n_tok} tokens in {dt:.1f}s = {n_tok/dt:.2f} tok/s")
+        print(f"[spec] {s['accepted']}/{s['drafted']} bozze accettate "
+              f"({s['accepted']/max(s['drafted'],1):.0%}), "
+              f"{s['cycles']} cicli, {s['partial']} parziali")
+    else:
+        for resp in stream_generate(model, tokenizer, text, max_tokens=args.max_tokens):
+            print(resp.text, end="", flush=True)
+            n_tok += 1
+        dt = time.time() - t0
+        print(f"\n\n--- {n_tok} tokens in {dt:.1f}s = {n_tok/dt:.2f} tok/s")
     if resp is not None:
         print(f"prefill: {resp.prompt_tokens} tokens at {resp.prompt_tps:.1f} tok/s")
     print(json.dumps(rt.stats(), indent=2))
