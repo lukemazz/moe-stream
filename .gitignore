@@ -10,3 +10,6 @@ q36/
 __pycache__/
 *.pyc
 .DS_Store
+app/
+serve.sh
+moe-stream.app/

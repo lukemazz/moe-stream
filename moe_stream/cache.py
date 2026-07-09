@@ -172,6 +172,19 @@ class ExpertCache:
                 _, old = d.popitem(last=False)
                 self.used[donor] -= entry_bytes(old)
 
+    def shrink_lru(self, new_bytes: int):
+        """Riduce il budget LRU sfrattando subito l'eccedenza: i pesi degli
+        esperti fanno spazio al KV quando il contesto cresce. One-way per la
+        sessione (non si riallarga): semplice e senza oscillazioni."""
+        with self.lock:
+            if new_bytes >= self.budget[LRU]:
+                return
+            self.budget[LRU] = new_bytes
+            d = self.tiers[LRU]
+            while d and self.used[LRU] > new_bytes:
+                _, old = d.popitem(last=False)
+                self.used[LRU] -= entry_bytes(old)
+
     # ------------------------------------------------------------ stats
 
     def filler_free_bytes(self) -> int:
