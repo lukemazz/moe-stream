@@ -16,6 +16,8 @@ from .cache import DecodeArena, ExpertCache, LRU, PREFETCH
 from .io_pool import FillerLoop, IOPool
 from .predictor import Predictor
 
+_PREFILL_LEGACY = bool(os.environ.get("MOE_PREFILL_LEGACY"))
+
 
 def _swiglu(gate, up):
     return nn.silu(gate) * up
@@ -227,19 +229,50 @@ class StreamedSwitchGLU(nn.Module):
                 out[mx.array(rows), mx.array(slots)] = ye
             return out.reshape(*lead, k, D)
 
+        # Prefill (many tokens). Sort the T*k routes by expert and run a
+        # segmented gather_qmm (sorted_indices=True): tokens hitting the same
+        # expert form one contiguous GEMM, so each expert's weight is read from
+        # memory once instead of once per token. The per-token gather path
+        # (xe=[T,1,1,D], rhs=[T,k]) re-read every weight ~T*k/uniq times — the
+        # bandwidth cost that made prefill compute/BW-bound.
         uniq, inv = np.unique(idx, return_inverse=True)
+        inv = inv.reshape(-1)          # numpy2 keeps idx's shape; flatten to T*k
         experts = [self._expert_arrays(int(e)) for e in uniq]
         stacked = {name: mx.stack([e[name] for e in experts])
                    for name in experts[0]}
-        ridx = mx.array(inv.reshape(T, k).astype(np.uint32))
 
-        xe = xt.reshape(T, 1, 1, D)
-        gu = self._gather_qmm(xe, stacked, "gateup_proj", ridx)
+        if _PREFILL_LEGACY:  # ponytail: A/B toggle, delete once win confirmed
+            ridx = mx.array(inv.reshape(T, k).astype(np.uint32))
+            xe = xt.reshape(T, 1, 1, D)
+            gu = self._gather_qmm(xe, stacked, "gateup_proj", ridx)
+            h = gu.shape[-1] // 2
+            y = self._gather_qmm(_swiglu(gu[..., :h], gu[..., h:]),
+                                 stacked, "down_proj", ridx)
+            return y.squeeze(-2).reshape(*lead, k, D)
+
+        order = np.argsort(inv, kind="stable")
+        lhs = mx.array((np.arange(T * k) // k)[order].astype(np.uint32))
+        rhs = mx.array(inv[order].astype(np.uint32))
+        ident = mx.arange(T * k, dtype=mx.uint32)
+
+        xg = xt.reshape(T, 1, D)
+        gu = mx.gather_qmm(
+            xg, stacked["gateup_proj.weight"], stacked["gateup_proj.scales"],
+            stacked["gateup_proj.biases"], lhs_indices=lhs, rhs_indices=rhs,
+            transpose=True, group_size=self.group_size, bits=self.bits,
+            sorted_indices=True)
         h = gu.shape[-1] // 2
-        y = self._gather_qmm(_swiglu(gu[..., :h], gu[..., h:]),
-                             stacked, "down_proj", ridx)
+        ys = mx.gather_qmm(
+            _swiglu(gu[..., :h], gu[..., h:]), stacked["down_proj.weight"],
+            stacked["down_proj.scales"], stacked["down_proj.biases"],
+            lhs_indices=ident, rhs_indices=rhs, transpose=True,
+            group_size=self.group_size, bits=self.bits,
+            sorted_indices=True).squeeze(1)      # [T*k, D], sorted order
 
-        return y.squeeze(-2).reshape(*lead, k, D)
+        inv_perm = np.empty(T * k, np.int64)
+        inv_perm[order] = np.arange(T * k)
+        y = ys[mx.array(inv_perm.astype(np.uint32))]
+        return y.reshape(*lead, k, D)
 
 
 class _EmbedHook(nn.Module):
